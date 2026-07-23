@@ -1,7 +1,7 @@
 ---
 title: "Service Layer: WalletPublicService vs WalletPrivateService"
 sidebarTitle: "Service Layer"
-description: "Wallet Manager exposes two service layers: WalletPublicService adds per-symbol queuing, argument validation, and audit logging on top of the raw WalletPrivateService."
+description: "Wallet Manager has two service layers: WalletPublicService adds per-symbol queuing, argument validation, and audit logging on top of WalletPrivateService."
 ---
 
 ## Two-Layer Architecture
@@ -206,8 +206,13 @@ public fetchPnl = ttl(
 The cache key is `"${symbol}-${limit}"`, so `fetchOrders("SOLUSDT", 25)`
 and `fetchOrders("SOLUSDT", 50)` are cached independently.
 
+`WalletPrivateService` also declares `const AVERAGE_PRICE_TTL = 5 * 60 * 1_000`
+(5 minutes), but this constant is not currently wired to any `ttl()` call —
+`fetchPrice` is a plain async method that delegates directly to `FETCH_PRICE_FN`.
+
 `fetchPrice` (via `FETCH_PRICE_FN`) uses its own **30-second TTL ticker
-cache** inside the underlying function.
+cache** inside the underlying function, controlled by `PRICE_UPDATE_MS = 30_000`
+in `src/function/fetch_price.function.ts`.
 
 ---
 

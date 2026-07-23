@@ -1,7 +1,7 @@
 ---
-title: "commitBuy: Guarded Limit Entry on Binance Spot"
+title: "commitBuy: Guarded Limit BUY Entry on Binance Spot"
 sidebarTitle: "commitBuy"
-description: "commitBuy places a guarded limit BUY order at avg×1.001, polls for fill every 10s up to 10 times, and falls back to a market buy on timeout. Returns 0 if guards fail."
+description: "commitBuy places a guarded limit BUY at avg×1.001, polls every 10 s up to 10 times, falls back to market buy on timeout, and returns 0 if guards fail."
 ---
 
 `commitBuy` is the primary entry function for opening a long position on Binance spot. Before placing any order it checks two guards — open orders on the symbol and available USDT balance — and returns `0` immediately if either guard fails, leaving the exchange untouched. When the guards pass, it places a limit BUY order priced slightly above the current average to improve fill probability, then waits up to 100 seconds for the fill. If the order has not filled by then, it cancels the resting limit order and market-buys whatever quantity is still unfilled, guaranteeing the entry is completed rather than left as a resting order on the book.

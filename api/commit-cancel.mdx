@@ -1,7 +1,7 @@
 ---
-title: "commitCancel: Flatten Symbol and Exit to Cash"
+title: "commitCancel: Cancel Orders and Flatten Position to Cash"
 sidebarTitle: "commitCancel"
-description: "commitCancel cancels all open orders on a symbol, verifies a clean book, then sells the entire free coin balance to USDT using a limit order with market fallback."
+description: "commitCancel cancels all open orders for a symbol, verifies a clean order book, then sells the full free coin balance to USDT with market fallback."
 ---
 
 `commitCancel` is the full position exit function. It implements the correct "cancel then sell" sequence that avoids the common broker-adapter mistake of selling while funds are still frozen in pending orders. On spot, every resting order locks its base coin (for a SELL) or USDT (for a BUY) — placing a new sell on top of that lock either fails with an insufficient-balance error or silently trades only the unlocked remainder. `commitCancel` eliminates this problem by first cancelling everything, verifying the book is clean, and only then selling the full free balance.

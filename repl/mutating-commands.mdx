@@ -1,14 +1,14 @@
 ---
-title: "REPL Mutating Commands: Buy, Sell, and Flatten Positions"
+title: "REPL Mutating Commands: Buy, Sell, Flatten, and Reload"
 sidebarTitle: "Mutating Commands"
-description: "Use commitBuy, commitSell, commitTrade, and commitCancel to place and manage real Binance spot orders from the REPL with guaranteed-fill logic."
+description: "Use commitBuy, commitSell, commitTrade, commitCancel, and commitReload to manage live Binance spot orders from the REPL with guaranteed-fill logic."
 ---
 
 <Warning>
   **Live keys, real money.** Every `commit*` call places real orders on Binance spot. There is no dry-run or paper-trading mode. Double-check symbol, amount, and price arguments before pressing Enter.
 </Warning>
 
-All four commands are accessed through `wallet.walletPublicService`, which wraps each call in a per-symbol serialized execution queue, validates arguments, clears internal caches after completion, and prints a structured audit log entry to `console.log` when the call resolves.
+All five commands are accessed through `wallet.walletPublicService`, which wraps each call in a per-symbol serialized execution queue, validates arguments, clears internal caches after completion, and prints a structured audit log entry to `console.log` when a trading call resolves.
 
 ---
 
@@ -120,8 +120,8 @@ repl => await wallet.walletPublicService.commitSell("SOLUSDT", 20)
 ```
 repl => await wallet.walletPublicService.commitTrade("SOLUSDT", 20, 85.0, 74.0)
 {
-  "status": "OK",
-  "content": "OCO order placed: TP 85.00 / SL 74.00"
+  "status": "ok",
+  "content": "Бот купил SOLUSDT (в размере 0.25) по цене 77.64 (19.41$)\nи выставил OCO ордер (take profit + stop loss):\n- Take Profit: 85.00 (21.25$)\n- Stop Loss: 74.00 (18.50$)\nДата/время: 14.11.2024 10:23:41"
 }
 ```
 
@@ -178,4 +178,29 @@ repl => await wallet.walletPublicService.commitCancel("SOLUSDT")
 
 <Note>
   The "cancel everything first, then sell" sequence is not optional. On Binance spot, every resting order locks its quantity (base coin for a SELL, USDT for a BUY). Selling into a lock silently reduces the fill or fails with insufficient balance. `commitCancel` always clears and verifies the order book before posting the closing sell.
+</Note>
+
+---
+
+## commitReload
+
+**Clears all internal caches for a symbol.** This is a lightweight maintenance command — it does not touch the exchange and places no orders. It calls `walletPrivateService.clear()`, which resets the TTL caches for `fetchOrders` and `fetchPnl` so the next read for any symbol fetches fresh data from Binance.
+
+Use `commitReload` when you want to force a fresh read without executing any trade. Under normal use this is unnecessary — all `commit*` trading commands automatically call `clear()` in their `finally` block — but it is useful if you modify external state outside the REPL or if you want to discard a stale cached PnL snapshot without running a trade.
+
+<ParamField path="symbol" type="string" required>
+  The Binance trading pair context for the reload. The symbol is used to route the call through the per-symbol serialized queue; the underlying cache clear applies globally to all symbols.
+</ParamField>
+
+**Return type:** `Promise<void>` — resolves with no value when the cache flush is complete.
+
+**REPL example:**
+
+```
+repl => await wallet.walletPublicService.commitReload("SOLUSDT")
+undefined
+```
+
+<Note>
+  `commitReload` does not produce an audit log entry. Unlike the other `commit*` commands, it does not call `console.log` with a `{ symbol, action, ... }` record because no order or exchange interaction occurs.
 </Note>

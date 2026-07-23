@@ -77,6 +77,9 @@ After every commit, `walletPrivateService.clear()` is also called to invalidate 
   <Card title="fetchPnl" icon="chart-line" href="/api/fetch-pnl">
     Daily PnL reconstructed from trade history using partial fill matching and VWAP.
   </Card>
+  <Card title="commitReload" icon="rotate" href="/api/wallet-public-service#commitreload">
+    Clears the WalletPrivateService cache for a symbol, forcing fresh data on the next fetch call.
+  </Card>
 </CardGroup>
 
 ## Full method signatures
@@ -126,6 +129,42 @@ const result = await walletPublicService.commitTrade("SOLUSDT", 20, 85.0, 74.0);
 const exitPrice = await walletPublicService.commitCancel("SOLUSDT");
 console.log("Exited at", exitPrice);
 ```
+
+## commitReload
+
+`commitReload` clears the `WalletPrivateService` internal cache for a symbol. It calls `walletPrivateService.clear()`, which invalidates the `fetchOrders` and `fetchPnl` TTL caches. After a reload, the next call to `fetchOrders` or `fetchPnl` for any symbol will fetch fresh data from the exchange.
+
+### Signature
+
+```typescript
+commitReload(symbol: string): Promise<void>
+```
+
+### Parameters
+
+<ParamField path="symbol" type="string" required>
+  Binance trading pair symbol, e.g. `"SOLUSDT"`. Used for queue routing — the cache clear applies globally across all symbols, not just the one passed.
+</ParamField>
+
+### Return value
+
+`Promise<void>` — resolves when the cache has been cleared. Does not interact with the exchange.
+
+### Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// Force a cache flush before reading fresh order history
+await walletPublicService.commitReload("SOLUSDT");
+const orders = await walletPublicService.fetchOrders("SOLUSDT");
+```
+
+<Note>
+  `commitReload` is called automatically by all `commit*` operations (`commitBuy`, `commitSell`, `commitTrade`, `commitCancel`) in their `finally` block, so you rarely need to call it manually. Use it when you want to force a cache refresh without placing an order — for example, after an external trade or manual intervention on the exchange.
+</Note>
 
 <Warning>
   `wallet.walletPrivateService` is the raw exchange adapter with no validation or queueing. It is exposed for debugging only. Do not call it directly in production code — concurrent calls on the same symbol can produce interleaved orders.

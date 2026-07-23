@@ -1,7 +1,7 @@
 ---
-title: "fetchBalance: Coin Balance with USDT Equivalent"
+title: "fetchBalance: Coin Holdings with USDT Equivalent Value"
 sidebarTitle: "fetchBalance"
-description: "fetchBalance returns the quantity and USDT value for a specific coin, including amounts locked in open orders, sourced from the Binance account balance endpoint."
+description: "fetchBalance returns the coin quantity and USDT value for a symbol, including amounts locked in open orders, using the Binance balance endpoint."
 ---
 
 `fetchBalance` returns the total coin holding for a given symbol — both the freely available portion and any quantity currently locked in open orders — together with its current USDT equivalent. The function is useful for inspecting position size and valuation before making trading decisions, but note that the quantity includes locked funds: it is not the same as the free tradeable amount.

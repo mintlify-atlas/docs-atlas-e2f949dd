@@ -1,8 +1,10 @@
 ---
-title: "Broker Adapter Overview: Wiring Wallet Manager to backtest-kit"
+title: "Wallet Manager Broker Adapter Overview (backtest-kit)"
 sidebarTitle: "Overview"
-description: "Wallet Manager provides the canonical exchange side of a backtest-kit broker adapter, encoding three rules that prevent orphaned orders, duplicate entries, and infinite retries."
+description: "Canonical backtest-kit broker adapter exchange layer — three rules that prevent orphaned orders, duplicate entries, and infinite retries on Binance spot."
 ---
+
+Wallet Manager's `src/function/` directory provides the order-management primitives that the reference `SpotBroker` adapter is built from. This section documents the three failure-mode rules the adapter encodes, the `waitForInit` startup hook, and how to wire the full class into a backtest-kit trading engine.
 
 ## What is a backtest-kit broker adapter?
 
@@ -18,7 +20,7 @@ Spot trading over a retry-capable engine creates three distinct failure modes. T
 
 Before throwing any error that will be retried, the adapter **cancels the unfilled order** and **market-sells any partial fill**. Without this, every "will retry" appends one more live order to the book — orders that can fill independently, creating positions the engine knows nothing about.
 
-```
+```text
 timeout → cancel open order → market-sell executedQty → throw Error (transient)
 ```
 
@@ -26,7 +28,7 @@ timeout → cancel open order → market-sell executedQty → throw Error (trans
 
 The engine passes `attempt` on every retry precisely so the adapter can reconcile state. Before posting a new BUY, the adapter queries by `origClientOrderId: signalId`. If the prior order was `FILLED`, it returns early — "already bought". If it is `NEW` or `PARTIALLY_FILLED`, it cancels the stale remainder before re-submitting.
 
-```
+```text
 attempt > 0 → query by origClientOrderId (= signalId)
   FILLED          → return (already bought, confirm silently)
   NEW / PARTIAL   → cancel stale remainder → re-submit fresh order
@@ -43,20 +45,41 @@ The engine's default retry budget is `CC_ORDER_OPEN_RETRY_ATTEMPTS = 5`, so `att
 
 `OrderRejectedError` is the terminal signal: the engine consumes the `signalId` into `lastPendingId` and never re-issues it. A plain `Error` is treated as transient and the engine keeps retrying indefinitely.
 
-```
+```text
 attempt >= 4 → cancel → market-sell executedQty → throw OrderRejectedError
 ```
 
 ## Adapter class structure
 
-The adapter extends `BrokerBase` and overrides two hooks:
+The adapter extends `BrokerBase` and overrides three hooks:
 
 | Hook | Responsibility |
 |---|---|
+| `waitForInit` | Called once at engine startup — initialize the Binance singleton and sweep startup orphans by `clientOrderId` |
 | `onOrderOpenCommit` | Place limit BUY, poll fill, cancel + roll back on timeout, reconcile on retry |
 | `onOrderCloseCommit` | Cancel all open orders, verify clean book, sell entire free balance |
 
-`BrokerBase` provides safe defaults for all other hooks — `onOrderActiveCheck`, `onPartialCommit`, and the rest — so only the two core commit methods need to be implemented.
+`BrokerBase` provides safe defaults for all other hooks — `onOrderActiveCheck`, `onPartialCommit`, and the rest — so only the three hooks above need to be implemented.
+
+### `waitForInit` — startup orphan sweep
+
+`waitForInit` is called once before the engine processes any signal. It is the recommended place to initialize the Binance API singleton and perform a startup orphan sweep: query open orders on all tracked symbols and cancel any whose `clientOrderId` matches a known `signalId` pattern. This cleans up any orders left by a previous crashed run before the engine resumes.
+
+```typescript
+override async waitForInit() {
+  await getBinance(); // your singleshot instance; the recommended place for an orphan sweep by clientOrderId
+}
+```
+
+## CLI dry-fire
+
+Before waiting for a live signal, any single hook can be exercised directly from the command line:
+
+```bash
+npx @backtest-kit/cli --brokerdebug --commit signal-open --symbol SOLUSDT
+```
+
+This invokes `onOrderOpenCommit` with a synthetic payload for `SOLUSDT`, placing a real order on the configured Binance account. Use it to verify API keys, quantity formatting, and the poll loop without running a full backtest session.
 
 Registration is two lines:
 

@@ -1,7 +1,7 @@
 ---
 title: "Wallet Manager REPL: Interactive Spot Trading Shell"
 sidebarTitle: "Overview"
-description: "The Wallet Manager REPL evaluates raw JavaScript with await support, pretty-prints results as JSON, and injects wallet and fs globals for hands-on Binance spot control."
+description: "The REPL evaluates raw JavaScript with await, pretty-prints results as JSON, and injects wallet and fs globals for hands-on Binance spot control."
 ---
 
 ## What is the REPL?
@@ -119,18 +119,13 @@ repl => await wallet.walletPublicService.fetchOrders("SOLUSDT", 5)
 ]
 
 repl => await wallet.walletPublicService.commitBuy("SOLUSDT", 20)
-{
-  "symbol": "SOLUSDT",
-  "action": "buy",
-  "amountUSDT": 20,
-  "averagePrice": 77.56,
-  "date": "2024-11-14T10:23:41.000Z",
-  "status": "success"
-}
+{ symbol: 'SOLUSDT', action: 'buy', amountUSDT: 20, averagePrice: 77.56, date: 2024-11-14T10:23:41.000Z, status: 'success' }
 77.64
 
 repl => exit
 ```
+
+The first line after the `commitBuy` prompt (`{ symbol: ..., status: 'success' }`) is the **audit log** printed automatically by `walletPublicService` via `console.log` — it is a side effect, not the return value. The second line (`77.64`) is the **return value** of `commitBuy`: the average fill price as a plain number.
 
 ---
 

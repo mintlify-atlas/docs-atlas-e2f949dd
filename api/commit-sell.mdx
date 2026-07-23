@@ -1,7 +1,7 @@
 ---
-title: "commitSell: Limit Sell with Market Fallback"
+title: "commitSell: Limit SELL Order with Market-Fill Fallback"
 sidebarTitle: "commitSell"
-description: "commitSell places a limit SELL order at avg×0.999, polls for fill every 10s up to 10 times, and falls back to a market sell on timeout. Returns average fill price."
+description: "commitSell places a limit SELL at avg×0.999, polls every 10 s up to 10 times, falls back to market sell on timeout, and returns the average fill price."
 ---
 
 `commitSell` sells a specified USDT-denominated amount of a coin back to USDT. Unlike `commitBuy`, it has **no open-order guard** — you can call it while other orders are live on the symbol. It places a limit SELL order priced slightly below the current average to improve fill speed, then polls for up to 100 seconds. On timeout it cancels the resting limit and market-sells the unfilled remainder, so the sell is always completed.

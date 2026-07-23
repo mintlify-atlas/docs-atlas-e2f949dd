@@ -1,7 +1,7 @@
 ---
-title: "fetchFiat: USDT Free and Locked Balance"
+title: "fetchFiat: Total Account USDT Balance Free and Locked"
 sidebarTitle: "fetchFiat"
-description: "fetchFiat returns the total USDT balance including both free and locked amounts from the Binance account, useful for checking available capital before a trade."
+description: "fetchFiat returns the total USDT balance (free and locked) from the Binance spot account, useful for checking available capital before placing a trade."
 ---
 
 `fetchFiat` returns the total USDT balance in your Binance spot account, summing both the freely available amount and any USDT currently locked in open BUY orders. It is the quickest way to inspect your capital position before deciding whether to place a new buy, and can be used to verify that enough USDT is present before calling `commitBuy` or `commitTrade`.

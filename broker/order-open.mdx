@@ -1,8 +1,10 @@
 ---
-title: "Implementing onOrderOpenCommit for Binance Spot"
+title: "onOrderOpenCommit: Limit Buy, Fill Polling, and Retry Rules"
 sidebarTitle: "Order Open"
 description: "The onOrderOpenCommit hook places a limit buy, polls for fill, cancels on timeout with market fallback, and reconciles by clientOrderId on retry attempts."
 ---
+
+`onOrderOpenCommit` is the broker hook the engine calls whenever it wants to open a new position. The steps below walk through the full reference implementation: limit BUY placement, fill polling, timeout rollback (Rule 1), retry reconciliation by `clientOrderId` (Rule 2), and terminal rejection on the fifth attempt (Rule 3).
 
 ## Overview
 
@@ -65,7 +67,7 @@ Binance's duplicate `clientOrderId` guard only protects **open** orders. An orde
 
 ```typescript
 const quantity = await formatQuantity(symbol, cost / priceOpen, binance);
-const price    = await formatPrice(symbol, priceOpen, binance);
+const price = await formatPrice(symbol, priceOpen, binance);
 ```
 
 Binance rejects orders whose quantity or price does not align with the symbol's filter precision. `formatQuantity` reads `LOT_SIZE.stepSize` from the exchange info and rounds to the correct number of decimal places. `formatPrice` does the same using `PRICE_FILTER.tickSize`.
@@ -174,7 +176,7 @@ override async onOrderOpenCommit(payload: BrokerOrderOpenPayload) {
   }
 
   const quantity = await formatQuantity(symbol, cost / priceOpen, binance);
-  const price    = await formatPrice(symbol, priceOpen, binance);
+  const price = await formatPrice(symbol, priceOpen, binance);
 
   const order = await binance.order("LIMIT", "BUY", symbol, Number(quantity), Number(price), {
     newClientOrderId: signalId,
@@ -215,7 +217,7 @@ override async onOrderOpenCommit(payload: BrokerOrderOpenPayload) {
 
 ## Decision tree
 
-```
+```text
 onOrderOpenCommit called
 │
 ├─ payload.backtest? ──────────────────────────────── return (no-op)

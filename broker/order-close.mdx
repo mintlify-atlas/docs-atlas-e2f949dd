@@ -1,8 +1,10 @@
 ---
 title: "Implementing onOrderCloseCommit: Flatten and Exit to Cash"
 sidebarTitle: "Order Close"
-description: "The onOrderCloseCommit hook cancels all open orders on the symbol, verifies zero resting orders, then sells the entire free coin balance to USDT with a market fallback."
+description: "Cancel all open orders, verify a clean book, and sell the entire free coin balance to USDT — the onOrderCloseCommit implementation for Binance spot."
 ---
+
+`onOrderCloseCommit` is the broker hook the engine calls to exit a position. It cancels every open order on the symbol, confirms the book is empty, then sells the full free coin balance to USDT — sweeping orphan tranches and guaranteeing a flat cash position regardless of how the coin was acquired.
 
 ## Overview
 
@@ -211,7 +213,7 @@ The exit sells the **entire free coin balance**, not the engine's `payload.quant
 override async onOrderCloseCommit(payload: BrokerOrderClosePayload) {
   if (payload.backtest) return;
   const { symbol, currentPrice } = payload;
-  const binance  = await getBinance();
+  const binance = await getBinance();
   const coinName = getCoinName(symbol);
 
   // Step 1: cancel sweep
@@ -258,7 +260,7 @@ override async onOrderCloseCommit(payload: BrokerOrderClosePayload) {
   }
 
   // Step 3: exit to cash
-  const account     = await binance.account();
+  const account = await binance.account();
   const coinBalance = account.balances.find(({ asset }) => asset === coinName);
   if (!coinBalance) throw new Error(`Can't fetch balance (close) for ${coinName}`);
   const freeQty = parseFloat(coinBalance.free);
@@ -266,11 +268,11 @@ override async onOrderCloseCommit(payload: BrokerOrderClosePayload) {
   const { minQty } = await getExchangeInfo(symbol, "LOT_SIZE", binance);
   if (!minQty) throw new Error(`Can't fetch minimal quantity (close) for ${coinName}`);
 
-  const maker    = account.makerCommission / 100;
+  const maker = account.makerCommission / 100;
   const quantity = freeQty - percentValue(freeQty, maker) - Number(minQty);
   if (quantity <= Number(minQty)) return; // dust
 
-  const sellQty   = await formatQuantity(symbol, quantity, binance);
+  const sellQty = await formatQuantity(symbol, quantity, binance);
   const sellPrice = await formatPrice(symbol, currentPrice * TRADE_SELL_LOWER_PERCENT, binance);
 
   const order = await binance.order("LIMIT", "SELL", symbol, Number(sellQty), Number(sellPrice));

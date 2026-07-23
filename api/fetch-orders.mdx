@@ -1,7 +1,7 @@
 ---
-title: "fetchOrders: Recent Order History with Status"
+title: "fetchOrders: Unified Order History with Live Status"
 sidebarTitle: "fetchOrders"
-description: "fetchOrders returns recent FILLED, CANCELED, and NEW orders for a symbol, combining open orders from openOrders with completed trades from the trades endpoint."
+description: "fetchOrders returns recent FILLED, CANCELED, and NEW orders for a symbol, merging open orders with completed trade history in a single sorted result."
 ---
 
 `fetchOrders` returns a unified, time-sorted list of recent orders for a symbol, merging pending open orders (status `NEW`) with completed trade history (status `FILLED` or `CANCELED`). The result gives a complete picture of recent activity on a symbol without requiring separate calls to the open-orders and trade-history endpoints. Results are cached for 10 minutes per `(symbol, limit)` key to avoid hammering the Binance rate limits during repeated inspection.

@@ -1,7 +1,7 @@
 ---
-title: "Wallet Manager: Binance Spot Wallet Toolkit"
+title: "Wallet Manager: Internal Binance Spot Wallet Toolkit"
 sidebarTitle: "Introduction"
-description: "Wallet Manager is a DI-wired Binance spot toolkit encoding cancel-before-sell order management, a REPL for manual trading, and reference broker-adapter flows for backtest-kit."
+description: "Wallet Manager is a DI-wired Binance spot toolkit with a REPL for manual trading and reference broker-adapter flows for backtest-kit."
 ---
 
 Wallet Manager is an internal Binance **spot** wallet toolkit: a small DI-wired service layer over `node-binance-api` paired with an interactive REPL. It encodes the correct order-management sequence — cancel pending orders, verify the book is clean, then sell — and exposes that logic both as a live trading tool and as the reference implementation for the exchange side of a [backtest-kit](https://github.com/tripolskypetr/backtest-kit) broker adapter.
@@ -38,7 +38,7 @@ The `commit_*` functions under `src/function/` are the exact order-management fl
 
 ## Order-management sequence
 
-```
+```text
 ┌─────────────────────────────────────────────────────────┐
 │  commitCancel / onOrderCloseCommit                      │
 │                                                         │
@@ -68,7 +68,7 @@ The service layer has two tiers:
 | `WalletPublicService` | **Use this one.** Per-symbol serialized execution queue, argument validation, and a structured `console.log` audit record after every commit: `{ symbol, action, amountUSDT, averagePrice, date, status }`. |
 | `WalletPrivateService` | Raw layer with no queueing or validation. Useful for debugging or building custom flows, but all production paths should go through `WalletPublicService`. |
 
-Both services are wired together with **DI** via [`di-kit`](https://www.npmjs.com/package/di-kit) and [`di-scoped`](https://www.npmjs.com/package/di-scoped). The `wallet` export from `src/index.ts` is both the default export and is assigned to `globalThis` so the REPL can use it without an import statement.
+Both services are wired together with **DI** via [`di-kit`](https://www.npmjs.com/package/di-kit). The `wallet` export from `src/index.ts` is both the default export and is assigned to `globalThis` so the REPL can use it without an import statement.
 
 Utility helpers (queue serialization, memoization, sleep, singleshot guards) come from [`functools-kit`](https://www.npmjs.com/package/functools-kit).
 
@@ -85,7 +85,6 @@ Utility helpers (queue serialization, memoization, sleep, singleshot guards) com
 |---|---|
 | [`node-binance-api`](https://www.npmjs.com/package/node-binance-api) | Binance REST + WebSocket client |
 | [`di-kit`](https://www.npmjs.com/package/di-kit) | Dependency-injection container |
-| [`di-scoped`](https://www.npmjs.com/package/di-scoped) | Scoped DI bindings |
 | [`functools-kit`](https://www.npmjs.com/package/functools-kit) | TTL memoize, serialized queues, singleshot guards, `sleep` |
 | [`pinolog`](https://www.npmjs.com/package/pinolog) | Structured console logging |
 | [`get-moment-stamp`](https://www.npmjs.com/package/get-moment-stamp) | Human-readable timestamps for audit records |

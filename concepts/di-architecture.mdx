@@ -1,7 +1,7 @@
 ---
 title: "Dependency Injection Architecture in Wallet Manager"
 sidebarTitle: "DI Architecture"
-description: "Wallet Manager uses di-kit and di-scoped for inversion-of-control wiring, binding WalletPrivateService and WalletPublicService to DI symbols resolved at startup."
+description: "Wallet Manager uses di-kit for inversion-of-control wiring, binding WalletPrivateService and WalletPublicService to DI symbols resolved at startup."
 ---
 
 ## Why Dependency Injection?
@@ -28,12 +28,11 @@ This gives three practical benefits:
 
 ## DI Dependencies
 
-Wallet Manager uses two packages from the same ecosystem:
+Wallet Manager's IoC container is provided by a single package:
 
 | Package | Role |
 |---|---|
 | `di-kit` | Core IoC container. Provides `createActivator`, which yields `provide`, `inject`, `init`, and `override`. |
-| `di-scoped` | Scoped injection support (used internally for lifecycle management). |
 
 ---
 
