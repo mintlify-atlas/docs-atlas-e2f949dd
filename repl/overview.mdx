@@ -1,0 +1,146 @@
+---
+title: "Wallet Manager REPL: Interactive Spot Trading Shell"
+sidebarTitle: "Overview"
+description: "The Wallet Manager REPL evaluates raw JavaScript with await support, pretty-prints results as JSON, and injects wallet and fs globals for hands-on Binance spot control."
+---
+
+## What is the REPL?
+
+The Wallet Manager REPL is a readline-based interactive shell that gives you direct, programmatic access to your Binance spot wallet from a terminal prompt. It is built on Node's `readline` module (see `scripts/repl.mjs`) and works by calling `eval()` on each line you type, so **any valid JavaScript expression is accepted** — including expressions that use `await`.
+
+Key characteristics:
+
+- **Top-level `await`** — every command can be async; the shell awaits the result before printing it.
+- **Pretty-printed output** — objects and arrays are serialized with `JSON.stringify(value, null, 2)` before being printed; primitives (numbers, strings) are printed as-is.
+- **Two injected globals** — `wallet` and `fs` are available on `globalThis` without any import.
+- **Exits cleanly** — type `exit` to close the readline interface and terminate the process.
+
+### Starting the REPL
+
+```bash
+npm start
+```
+
+`npm start` runs the build step first, then launches `scripts/repl.mjs` with `.env` loaded via `dotenv`. Make sure your `.env` file is in the project root:
+
+```bash
+CC_BINANCE_API_KEY=...
+CC_BINANCE_API_SECRET=...
+```
+
+---
+
+## Injected Globals
+
+### `wallet` — the service container
+
+The `wallet` global exposes two services:
+
+| Property | Description |
+|---|---|
+| `wallet.walletPublicService` | **Use this one.** Per-symbol serialized execution queue, argument validation, and a structured audit log entry printed to `console.log` after every commit. |
+| `wallet.walletPrivateService` | The raw layer underneath — no queueing, no validation, no audit log. For debugging only. |
+
+#### Why prefer `walletPublicService`?
+
+`walletPublicService` wraps every call in a **per-symbol `queued` execution gate** (from `functools-kit`). Concurrent calls for the same symbol are serialized, so you can never accidentally fire two mutating commands on the same symbol at the same time. It also validates argument types before touching the exchange and flushes internal caches after every commit so the next read reflects the new state.
+
+### `fs` — Node's `fs` module
+
+The standard `fs` module is injected as `globalThis.fs`. Use it to dump large results to disk rather than scrolling through terminal output:
+
+```js
+repl => const result = await wallet.walletPublicService.fetchPnl("SOLUSDT", 50)
+repl => fs.writeFileSync("out.json", JSON.stringify(result, null, 2))
+```
+
+---
+
+## Audit Log
+
+After every `commit*` call completes (successfully or not), `walletPublicService` prints a structured audit record to `console.log`:
+
+```json
+{
+  "symbol": "SOLUSDT",
+  "action": "buy",
+  "amountUSDT": 20,
+  "averagePrice": 77.56,
+  "date": "2024-11-14T10:23:41.000Z",
+  "status": "success"
+}
+```
+
+| Field | Value |
+|---|---|
+| `symbol` | The trading pair (e.g. `"SOLUSDT"`) |
+| `action` | One of `"buy"`, `"sell"`, `"trade"`, `"cancel"` |
+| `amountUSDT` | The USDT amount requested (0 for `commitCancel`) |
+| `averagePrice` | The market price snapshot taken before the order was placed |
+| `date` | JavaScript `Date` object — the moment the commit resolved |
+| `status` | `"success"` if no exception was thrown; `"failed"` otherwise |
+
+---
+
+## Example REPL Session
+
+The following is a real session from the README showing a price check followed by a clean exit:
+
+```
+repl => await wallet.walletPublicService.fetchPrice("SOLUSDT")
+77.56
+repl => exit
+```
+
+A more complete session covering reads and a trade:
+
+```
+repl => await wallet.walletPublicService.fetchFiat("SOLUSDT")
+430.12
+
+repl => await wallet.walletPublicService.fetchBalance("SOLUSDT")
+{
+  "quantity": 5.21,
+  "usdt": 404.69
+}
+
+repl => await wallet.walletPublicService.fetchOrders("SOLUSDT", 5)
+[
+  {
+    "symbol": "SOLUSDT",
+    "orderId": 3849201,
+    "status": "FILLED",
+    "side": "BUY",
+    "price": "77.64",
+    "amount": "0.25",
+    "executedQty": "0.25",
+    "time": "2024-11-14T09:55:00.000Z"
+  }
+]
+
+repl => await wallet.walletPublicService.commitBuy("SOLUSDT", 20)
+{
+  "symbol": "SOLUSDT",
+  "action": "buy",
+  "amountUSDT": 20,
+  "averagePrice": 77.56,
+  "date": "2024-11-14T10:23:41.000Z",
+  "status": "success"
+}
+77.64
+
+repl => exit
+```
+
+---
+
+## Dumping Results to a File
+
+When a command returns a large array (e.g. `fetchPnl` with a high limit), pipe the result to disk:
+
+```js
+repl => const pnl = await wallet.walletPublicService.fetchPnl("SOLUSDT", 90)
+repl => fs.writeFileSync("pnl.json", JSON.stringify(pnl, null, 2))
+```
+
+Open `pnl.json` in any editor or feed it to `jq` for offline analysis.

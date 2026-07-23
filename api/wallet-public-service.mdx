@@ -1,0 +1,132 @@
+---
+title: "WalletPublicService: Queued Binance Spot Service API"
+sidebarTitle: "WalletPublicService"
+description: "WalletPublicService wraps WalletPrivateService with per-symbol queuing, argument validation, and structured audit logging after every commit operation."
+---
+
+`WalletPublicService` is the recommended entry point for all exchange operations. It wraps the lower-level `WalletPrivateService` with three key guarantees: per-symbol serialized execution via a `queued` runner (so concurrent calls on the same symbol are never interleaved), up-front argument validation that throws descriptive errors before anything reaches the exchange, and a structured `console.log` audit record emitted in a `finally` block after every commit — whether the operation succeeds or fails.
+
+## Accessing the singleton
+
+The `wallet` export exposes both service layers as a single container object. Always use `walletPublicService` unless you are debugging the raw exchange adapter directly.
+
+```typescript
+import wallet from "wallet-manager";
+// or: import { wallet } from "wallet-manager";
+
+const { walletPublicService } = wallet;
+```
+
+The REPL (started with `npm start`) injects `wallet` as a global, so you can call any method directly:
+
+```
+repl => await wallet.walletPublicService.fetchPrice("SOLUSDT")
+77.56
+```
+
+## Per-symbol execution queue
+
+Internally, `WalletPublicService` maintains one `EventListener` instance per symbol, keyed by a memoized runner (`getRunner`). Each `EventListener` wraps its `execute` method with `queued` from `functools-kit`, which serializes all calls on that runner. This means two concurrent `commitBuy("SOLUSDT", …)` calls will run strictly one after the other — the second waits for the first to fully resolve, including its full poll loop and any market-fallback order.
+
+Symbols are independent: a `commitBuy("SOLUSDT", …)` and a `commitBuy("BTCUSDT", …)` running at the same time do not block each other.
+
+## Audit log format
+
+After every `commit*` call (`commitBuy`, `commitSell`, `commitTrade`, `commitCancel`), the service emits a structured record via `console.log` inside the `finally` block, regardless of whether the operation succeeded or threw:
+
+```typescript
+{
+  symbol: string;       // e.g. "SOLUSDT"
+  action: "buy" | "sell" | "trade" | "cancel";
+  amountUSDT: number;   // 0 for commitCancel
+  averagePrice: number; // market price fetched before the operation
+  date: Date;           // timestamp of completion
+  status: "success" | "failed";
+}
+```
+
+After every commit, `walletPrivateService.clear()` is also called to invalidate the order and PnL caches, ensuring the next `fetchOrders` or `fetchPnl` call reflects the latest state.
+
+## Methods
+
+<CardGroup cols={2}>
+  <Card title="commitBuy" icon="arrow-trend-up" href="/api/commit-buy">
+    Guarded limit BUY at avg×1.001 with poll loop and market fallback. Returns 0 if guards fail.
+  </Card>
+  <Card title="commitSell" icon="arrow-trend-down" href="/api/commit-sell">
+    Limit SELL at avg×0.999 with poll loop and market fallback. Returns average fill price.
+  </Card>
+  <Card title="commitTrade" icon="arrows-left-right" href="/api/commit-trade">
+    Buy via commitBuy flow then immediately place an OCO take-profit and stop-loss.
+  </Card>
+  <Card title="commitCancel" icon="ban" href="/api/commit-cancel">
+    Cancel all open orders, verify clean book, sell entire free coin balance to USDT.
+  </Card>
+  <Card title="fetchPrice" icon="tag" href="/api/fetch-price">
+    Current Binance average price for a symbol, formatted to tick size. 30s cache.
+  </Card>
+  <Card title="fetchBalance" icon="wallet" href="/api/fetch-balance">
+    Coin quantity and USDT equivalent, including amounts locked in open orders.
+  </Card>
+  <Card title="fetchFiat" icon="dollar-sign" href="/api/fetch-fiat">
+    Total USDT balance (free + locked) from the Binance account.
+  </Card>
+  <Card title="fetchOrders" icon="list" href="/api/fetch-orders">
+    Recent FILLED, CANCELED, and NEW orders. 10-minute TTL cache.
+  </Card>
+  <Card title="fetchPnl" icon="chart-line" href="/api/fetch-pnl">
+    Daily PnL reconstructed from trade history using partial fill matching and VWAP.
+  </Card>
+</CardGroup>
+
+## Full method signatures
+
+```typescript
+class WalletPublicService {
+  commitBuy(symbol: string, amountUSDT: number): Promise<number>;
+  commitSell(symbol: string, amountUSDT: number): Promise<number>;
+  commitTrade(
+    symbol: string,
+    amountUSDT: number,
+    takeProfitPrice: number,
+    stopLossPrice: number
+  ): Promise<0 | { status: string; content: string }>;
+  commitCancel(symbol: string): Promise<number>;
+  fetchBalance(symbol: string): Promise<{ usdt: number; quantity: number }>;
+  fetchOrders(symbol: string, limit?: number): Promise<IOrderData[]>;
+  fetchPrice(symbol: string): Promise<number>;
+  fetchFiat(symbol: string): Promise<number>;
+  fetchPnl(symbol: string, limit?: number): Promise<IDailyPnL[]>;
+  commitReload(symbol: string): Promise<void>;
+}
+```
+
+## Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// Inspect current state
+const price   = await walletPublicService.fetchPrice("SOLUSDT");
+const fiat    = await walletPublicService.fetchFiat("SOLUSDT");
+const balance = await walletPublicService.fetchBalance("SOLUSDT");
+console.log({ price, fiat, balance });
+
+// Enter a guarded position
+const fillPrice = await walletPublicService.commitBuy("SOLUSDT", 20);
+console.log("Filled at", fillPrice); // 0 if guards prevented entry
+
+// Enter with OCO brackets in one call
+const result = await walletPublicService.commitTrade("SOLUSDT", 20, 85.0, 74.0);
+// => { status: "ok", content: "..." } or 0
+
+// Flatten the entire position
+const exitPrice = await walletPublicService.commitCancel("SOLUSDT");
+console.log("Exited at", exitPrice);
+```
+
+<Warning>
+  `wallet.walletPrivateService` is the raw exchange adapter with no validation or queueing. It is exposed for debugging only. Do not call it directly in production code — concurrent calls on the same symbol can produce interleaved orders.
+</Warning>

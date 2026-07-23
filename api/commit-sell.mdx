@@ -1,0 +1,92 @@
+---
+title: "commitSell: Limit Sell with Market Fallback"
+sidebarTitle: "commitSell"
+description: "commitSell places a limit SELL order at avg×0.999, polls for fill every 10s up to 10 times, and falls back to a market sell on timeout. Returns average fill price."
+---
+
+`commitSell` sells a specified USDT-denominated amount of a coin back to USDT. Unlike `commitBuy`, it has **no open-order guard** — you can call it while other orders are live on the symbol. It places a limit SELL order priced slightly below the current average to improve fill speed, then polls for up to 100 seconds. On timeout it cancels the resting limit and market-sells the unfilled remainder, so the sell is always completed.
+
+## Signature
+
+```typescript
+commitSell(symbol: string, amountUSDT: number): Promise<number>
+```
+
+## Parameters
+
+<ParamField path="symbol" type="string" required>
+  Binance trading pair symbol, e.g. `"SOLUSDT"`. Must be a valid spot symbol listed on Binance.
+</ParamField>
+
+<ParamField path="amountUSDT" type="number" required>
+  The USDT-denominated amount to sell. The coin quantity is computed as `amountUSDT / averagePrice` via `usdToCoins()`. Validated in `WalletPublicService` — must be a finite number and `≥ 0`. Throws if the value is `NaN`, not a number, or negative.
+</ParamField>
+
+## Return value
+
+`Promise<number>` — average fill price from the order's `fills` array (arithmetic mean over fill prices). Returns the fallback `orderPrice` if the `fills` array is empty.
+
+## Order logic
+
+1. **Limit price** — `averagePrice × 0.999` (0.1% below the 5-minute weighted average), formatted to the symbol's `PRICE_FILTER` `tickSize`. Pricing slightly below market makes the order more likely to fill quickly as a maker order.
+2. **Quantity** — `usdToCoins(amountUSDT, averagePrice)` converted to a string via `formatQuantity()` using the `LOT_SIZE` `stepSize`.
+3. A `LIMIT SELL` order is placed via `binance.order("LIMIT", "SELL", symbol, quantity, averagePrice)`.
+
+## Poll loop
+
+If the order is not instantly `FILLED`, `commitSell` enters the same poll loop as `commitBuy`:
+
+- **10 iterations** × **10-second sleep** = up to **100 seconds** total wait.
+- Each iteration calls `binance.orderStatus(symbol, orderId)` and exits immediately on `status === "FILLED"`.
+
+## Timeout fallback
+
+If all 10 iterations complete without a fill:
+
+1. The limit order is **cancelled** via `binance.cancel(symbol, orderId)`.
+2. The unfilled remainder (`quantity - lastStatus.executedQty`) is **market-sold** via `binance.marketSell(symbol, remainderQty)`.
+3. Average fill price from the market order is returned.
+
+## Validation in WalletPublicService
+
+```typescript
+if (typeof amountUSDT !== "number" || isNaN(amountUSDT)) {
+  throw new Error("amountUSDT must be a valid number");
+}
+if (amountUSDT < 0) {
+  throw new Error("amountUSDT must be greater than zero");
+}
+```
+
+## Audit log
+
+After completion, `WalletPublicService` emits:
+
+```typescript
+console.log({
+  symbol,
+  action: "sell",
+  amountUSDT,
+  averagePrice,
+  date: new Date(),
+  status: "success" | "failed",
+});
+```
+
+## Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// REPL usage:
+// repl => await wallet.walletPublicService.commitSell("SOLUSDT", 20)
+
+const fillPrice = await walletPublicService.commitSell("SOLUSDT", 20);
+console.log(`Sold at average price: ${fillPrice}`);
+```
+
+<Warning>
+  `commitSell` sells only a fixed USDT-denominated **portion** of your coin balance. If you want to exit an entire position — including cancelling open TP/SL orders and selling the whole free balance — use [`commitCancel`](/api/commit-cancel) instead. Selling a partial amount while an OCO order is still live may result in an over-committed position where the OCO attempts to sell coins you no longer hold.
+</Warning>

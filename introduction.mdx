@@ -1,0 +1,112 @@
+---
+title: "Wallet Manager: Binance Spot Wallet Toolkit"
+sidebarTitle: "Introduction"
+description: "Wallet Manager is a DI-wired Binance spot toolkit encoding cancel-before-sell order management, a REPL for manual trading, and reference broker-adapter flows for backtest-kit."
+---
+
+Wallet Manager is an internal Binance **spot** wallet toolkit: a small DI-wired service layer over `node-binance-api` paired with an interactive REPL. It encodes the correct order-management sequence — cancel pending orders, verify the book is clean, then sell — and exposes that logic both as a live trading tool and as the reference implementation for the exchange side of a [backtest-kit](https://github.com/tripolskypetr/backtest-kit) broker adapter.
+
+## The problem it solves
+
+The most common broker-adapter implementation mistake is trying to sell an asset while its funds are still frozen in a pending order. On Binance spot, every resting order locks its quantity — the base coin for a `SELL`, USDT for a `BUY`. A sell placed on top of that lock either fails with an insufficient-balance error, or silently trades only the unlocked remainder while TP/SL/stale entry orders keep holding the rest.
+
+The correct sequence is always:
+
+1. **Cancel** all pending orders on the symbol.
+2. **Verify** the book is clean — zero open orders remain.
+3. **Sell** the entire free coin balance to USDT with a new order.
+
+This is exactly the flow that `commitCancel` (and the `onOrderCloseCommit` example in the broker-adapter section) implements. Every mutating commit in `WalletPublicService` is built around this discipline.
+
+<Warning>
+  **Live keys, real money.** Every `commit*` call places real orders on Binance
+  spot. There is no dry-run or paper-trading mode. Never run Wallet Manager
+  against keys that have withdrawal permissions.
+</Warning>
+
+## Two jobs
+
+Wallet Manager serves two distinct purposes:
+
+**1. Manual exchange control via REPL**
+
+Drive the exchange by hand — buy, sell, or flatten a symbol; inspect balances, open orders, and daily PnL — without touching any trading engine. The REPL evaluates raw JavaScript (`await` is allowed), pretty-prints object results as JSON, and gives you full access to the service layer through the `wallet` global.
+
+**2. Reference implementation for backtest-kit broker adapters**
+
+The `commit_*` functions under `src/function/` are the exact order-management flows — limit-post → poll-for-fill → cancel-on-timeout → market-order fallback — that a production broker adapter is built from. Reading the Wallet Manager source and the annotated adapter example in the [Broker Adapter](/broker/overview) guide gives you a ready-to-adapt blueprint that already handles the three hard problems: transient-throw cleanup, idempotent reconcile by `clientOrderId`, and terminal rejection on the fifth attempt.
+
+## Order-management sequence
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  commitCancel / onOrderCloseCommit                      │
+│                                                         │
+│  1. Cancel ALL open orders on the symbol                │
+│     (up to 10 rounds, individual failures tolerated)    │
+│                                                         │
+│  2. Verify open-order count == 0                        │
+│     (poll up to 10 rounds, throw on failure)            │
+│                                                         │
+│  3. Sell ENTIRE free coin balance to USDT               │
+│     limit @ price × 0.999 → poll → cancel + market     │
+└─────────────────────────────────────────────────────────┘
+```
+
+<Note>
+  The three-step sequence above also sweeps any **orphan tranches** — coin
+  bought outside the engine (e.g. a manual REPL purchase) — because it sells
+  the entire free balance rather than just the engine's tracked position size.
+</Note>
+
+## Architecture overview
+
+The service layer has two tiers:
+
+| Service | Role |
+|---|---|
+| `WalletPublicService` | **Use this one.** Per-symbol serialized execution queue, argument validation, and a structured `console.log` audit record after every commit: `{ symbol, action, amountUSDT, averagePrice, date, status }`. |
+| `WalletPrivateService` | Raw layer with no queueing or validation. Useful for debugging or building custom flows, but all production paths should go through `WalletPublicService`. |
+
+Both services are wired together with **DI** via [`di-kit`](https://www.npmjs.com/package/di-kit) and [`di-scoped`](https://www.npmjs.com/package/di-scoped). The `wallet` export from `src/index.ts` is both the default export and is assigned to `globalThis` so the REPL can use it without an import statement.
+
+Utility helpers (queue serialization, memoization, sleep, singleshot guards) come from [`functools-kit`](https://www.npmjs.com/package/functools-kit).
+
+<Tip>
+  `WalletPrivateService` methods accept an explicit `averagePrice` argument for
+  sizing — use it when you already have a price from `fetchPrice` to avoid a
+  second round-trip. `WalletPublicService` fetches the price itself and hides
+  that parameter from the public API.
+</Tip>
+
+## Key dependencies
+
+| Package | Purpose |
+|---|---|
+| [`node-binance-api`](https://www.npmjs.com/package/node-binance-api) | Binance REST + WebSocket client |
+| [`di-kit`](https://www.npmjs.com/package/di-kit) | Dependency-injection container |
+| [`di-scoped`](https://www.npmjs.com/package/di-scoped) | Scoped DI bindings |
+| [`functools-kit`](https://www.npmjs.com/package/functools-kit) | TTL memoize, serialized queues, singleshot guards, `sleep` |
+| [`pinolog`](https://www.npmjs.com/package/pinolog) | Structured console logging |
+| [`get-moment-stamp`](https://www.npmjs.com/package/get-moment-stamp) | Human-readable timestamps for audit records |
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Configure your API keys, build the ESM bundle, and run your first REPL
+    commands in under 5 minutes.
+  </Card>
+  <Card title="REPL Guide" icon="terminal" href="/repl/overview">
+    Full reference for every read-only and mutating command available in the
+    interactive REPL.
+  </Card>
+  <Card title="Broker Adapter" icon="plug" href="/broker/overview">
+    Annotated backtest-kit adapter example built on the Wallet Manager
+    commit flows.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/wallet-public-service">
+    TypeScript type signatures for WalletPublicService, WalletPrivateService,
+    IOrderData, and IDailyPnL.
+  </Card>
+</CardGroup>

@@ -1,0 +1,86 @@
+---
+title: "commitCancel: Flatten Symbol and Exit to Cash"
+sidebarTitle: "commitCancel"
+description: "commitCancel cancels all open orders on a symbol, verifies a clean book, then sells the entire free coin balance to USDT using a limit order with market fallback."
+---
+
+`commitCancel` is the full position exit function. It implements the correct "cancel then sell" sequence that avoids the common broker-adapter mistake of selling while funds are still frozen in pending orders. On spot, every resting order locks its base coin (for a SELL) or USDT (for a BUY) — placing a new sell on top of that lock either fails with an insufficient-balance error or silently trades only the unlocked remainder. `commitCancel` eliminates this problem by first cancelling everything, verifying the book is clean, and only then selling the full free balance.
+
+## Signature
+
+```typescript
+commitCancel(symbol: string): Promise<number>
+```
+
+## Parameters
+
+<ParamField path="symbol" type="string" required>
+  Binance trading pair symbol to flatten, e.g. `"SOLUSDT"`. All open orders on this symbol will be cancelled and the entire free coin balance will be sold.
+</ParamField>
+
+## Return value
+
+`Promise<number>` — average exit price from the sell order's `fills` array. Returns `0` if the free coin balance (after subtracting the maker fee and `minQty` dust) is at or below `minQty` — nothing to sell.
+
+## Execution flow
+
+<Steps>
+  <Step title="Cancel all open orders">
+    Iterates up to **10 rounds**. Each round calls `binance.openOrders(symbol)` and attempts `binance.cancel(symbol, orderId)` for every live order, with a 1-second sleep between individual cancels. Individual cancel errors are caught and tolerated — the sweep loop continues to the next order and retries on the next round. The loop exits early once `openOrders` returns an empty list. Throws only if the final round still has errors.
+  </Step>
+  <Step title="Verify zero open orders">
+    After the cancel sweep, a second loop polls `binance.openOrders(symbol)` up to **10 times** (1-second sleep each). If any order remains after all 10 attempts, throws `Error("Order not canceled")`. This hard verification prevents the sell step from running while any order might still be locking funds.
+  </Step>
+  <Step title="Sell entire free coin balance">
+    Fetches the full balance map via `FETCH_BALANCE_FN`. Reads the `minQty` and maker fee for the symbol. Computes the sellable quantity:
+
+    ```typescript
+    const quantity =
+      balance.quantity
+      - percentValue(balance.quantity, maker)  // subtract maker fee
+      - minQty;                                // subtract minimum lot dust
+    ```
+
+    If `quantity <= minQty`, returns `0` (dust only — nothing to sell).
+
+    Otherwise, formats the quantity to `LOT_SIZE` `stepSize` and places a `LIMIT SELL` at `averagePrice × 0.999` (formatted to `PRICE_FILTER` `tickSize`). Polls up to **10 × 10s**. On timeout: cancels the limit and market-sells the remaining unfilled quantity via `binance.marketSell()`.
+  </Step>
+</Steps>
+
+## Audit log
+
+After completion, `WalletPublicService` emits:
+
+```typescript
+console.log({
+  symbol,
+  action: "cancel",
+  amountUSDT: 0,    // always 0 — the full balance is sold, not a fixed amount
+  averagePrice,     // price fetched before enqueuing
+  date: new Date(),
+  status: "success" | "failed",
+});
+```
+
+## Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// REPL usage:
+// repl => await wallet.walletPublicService.commitCancel("SOLUSDT")
+
+const exitPrice = await walletPublicService.commitCancel("SOLUSDT");
+
+if (exitPrice === 0) {
+  console.log("Nothing to sell — balance was below minimum lot size");
+} else {
+  console.log(`Exited SOLUSDT at average price: ${exitPrice}`);
+}
+```
+
+<Warning>
+  `commitCancel` sells your **entire free balance** of the coin, not a specific USDT amount. If you hold more coins than the position you want to close, do not use this function — use `commitSell` with an explicit `amountUSDT` instead. `commitCancel` is designed for the case where you want to fully flatten a symbol and return all funds to USDT.
+</Warning>

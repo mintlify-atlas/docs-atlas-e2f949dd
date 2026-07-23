@@ -1,0 +1,333 @@
+---
+title: "Full backtest-kit SpotBroker Integration Example"
+sidebarTitle: "Integration Example"
+description: "Complete TypeScript SpotBroker class extending BrokerBase, implementing onOrderOpenCommit and onOrderCloseCommit, registered with Broker.useBrokerAdapter and Broker.enable."
+---
+
+## Introduction
+
+This page contains the complete reference `SpotBroker` adapter from the Wallet Manager README. It is the canonical starting point for wiring Binance spot to a backtest-kit trading engine. Copy it into your project, replace `getBinance()` with your own singleton initializer, and adjust the constants as needed.
+
+For a detailed walkthrough of each method see [Order Open](/broker/order-open) and [Order Close](/broker/order-close).
+
+## Required imports
+
+```typescript
+import {
+  Broker,
+  BrokerBase,
+  BrokerOrderOpenPayload,
+  BrokerOrderClosePayload,
+  OrderRejectedError,
+} from "backtest-kit";
+
+import { memoize, sleep } from "functools-kit";
+import Binance from "node-binance-api";
+```
+
+| Package | Role |
+|---|---|
+| `backtest-kit` | Engine base class, payload types, and `OrderRejectedError` for terminal rejection |
+| `functools-kit` | `memoize` (exchange-info cache) and `sleep` (poll interval) |
+| `node-binance-api` | Binance REST client — orders, account balances, exchange info |
+
+## Complete `SpotBroker` class
+
+```typescript
+import {
+  Broker,
+  BrokerBase,
+  BrokerOrderOpenPayload,
+  BrokerOrderClosePayload,
+  OrderRejectedError,
+} from "backtest-kit";
+import { memoize, sleep } from "functools-kit";
+import Binance from "node-binance-api";
+
+const FILL_POLL_ATTEMPTS = 10;          // 10 checks ...
+const FILL_POLL_INTERVAL_MS = 10_000;   // ... every 10 seconds = up to ~100 s waiting for the fill
+const LAST_OPEN_ATTEMPT = 4;            // the fifth try under CC_ORDER_OPEN_RETRY_ATTEMPTS = 5
+const CANCEL_ROUNDS = 10;               // cancel sweeps while flattening the symbol on close
+const TRADE_SELL_LOWER_PERCENT = 0.999; // exit limit price slightly below market — fills faster
+
+const roundTicks = (value: number, tickSize: string) => {
+  const precision = Math.max(tickSize.replace(/0+$/, "").indexOf("1") - 1, 0);
+  return Number(value).toFixed(precision);
+};
+
+const getExchangeInfo = memoize(
+  ([symbol, filterType]) => `${symbol}-${filterType}`,
+  async (symbol: string, filterType = "LOT_SIZE", binance: Binance) => {
+    const exchangeInfo = await binance.exchangeInfo();
+    const filters = Object.values(exchangeInfo.symbols)
+      .map(({ symbol, filters }) => [
+        symbol,
+        filters.find((f: any) => f.filterType === filterType),
+      ])
+      .reduce<any>((acm, [k, v]) => ({ ...acm, [k]: v }), {});
+    const { stepSize, tickSize, minQty } = filters[symbol];
+    return { stepSize, tickSize, minQty };
+  }
+);
+
+const formatQuantity = async (symbol: string, quantity: number, binance: Binance) => {
+  const { stepSize } = await getExchangeInfo(symbol, "LOT_SIZE", binance);
+  return roundTicks(quantity, stepSize);
+};
+
+const formatPrice = async (symbol: string, price: number, binance: Binance) => {
+  const { tickSize } = await getExchangeInfo(symbol, "PRICE_FILTER", binance);
+  return roundTicks(price, tickSize);
+};
+
+const getCoinName = (symbol: string) => symbol.replace(/USDT$/, "");
+
+const percentValue = (value: number, percent: number) => (value * percent) / 100;
+
+class SpotBroker extends BrokerBase {
+  override async waitForInit() {
+    await getBinance(); // your singleshot instance; the recommended place for an orphan sweep by clientOrderId
+  }
+
+  override async onOrderOpenCommit(payload: BrokerOrderOpenPayload) {
+    if (payload.backtest) return;          // never touch the exchange in backtest mode
+    if (payload.type !== "active") return; // "schedule" (resting-order placement) is a separate branch
+    const { symbol, signalId, attempt, cost, priceOpen } = payload;
+    const binance = await getBinance();
+
+    // Rule 2: attempt > 0 — the previous attempt may have reached the exchange.
+    // Reconcile by clientOrderId BEFORE posting again: an order filled behind a
+    // lost response resolves to "already bought", a stale one gets cancelled.
+    if (attempt > 0) {
+      const prior = await binance
+        .orderStatus(symbol, undefined, undefined, { origClientOrderId: signalId })
+        .catch(() => null);
+      if (prior?.status === "FILLED") {
+        return; // the position was already opened by the previous attempt — confirm without re-sending
+      }
+      if (prior && (prior.status === "NEW" || prior.status === "PARTIALLY_FILLED")) {
+        await binance.cancel(symbol, prior.orderId); // kill the stale remainder
+      }
+    }
+
+    const quantity = await formatQuantity(symbol, cost / priceOpen, binance);
+    const price    = await formatPrice(symbol, priceOpen, binance);
+
+    // clientOrderId = signalId — the idempotency anchor for the reconcile above
+    const order = await binance.order("LIMIT", "BUY", symbol, Number(quantity), Number(price), {
+      newClientOrderId: signalId,
+    });
+
+    if (order.status === "FILLED") {
+      return; // confirmed — the engine opens the position
+    }
+
+    // Wait for the order to close: await + sleep in a loop
+    let last = order;
+    for (let i = 0; i !== FILL_POLL_ATTEMPTS; i++) {
+      await sleep(FILL_POLL_INTERVAL_MS);
+      last = await binance.orderStatus(symbol, order.orderId);
+      if (last.status === "FILLED") {
+        return; // fill arrived — confirm
+      }
+    }
+
+    // Rule 1: timeout — the order must NOT stay alive on the exchange.
+    // Cancel and roll back the partial fill so the state is clean before the retry.
+    await binance.cancel(symbol, order.orderId);
+    const executedQty = Number(last?.executedQty ?? 0);
+    if (executedQty > 0) {
+      const sellQty = await formatQuantity(symbol, executedQty, binance);
+      await binance.marketSell(symbol, Number(sellQty));
+    }
+
+    // Rule 3: the fifth attempt is a terminal rejection. The engine consumes
+    // OrderRejectedError into lastPendingId: this signal id is never re-issued.
+    if (attempt >= LAST_OPEN_ATTEMPT) {
+      throw new OrderRejectedError(
+        `entry ${signalId} not filled after ${attempt + 1} attempts — giving up`
+      );
+    }
+
+    // Transient: the engine retries on the next tick with the SAME signalId,
+    // attempt arrives incremented — the reconcile at the top kicks in.
+    throw new Error(`Limit order [buy ${quantity} ${symbol} @ ${price}] not filled — backtest-kit will retry`);
+  }
+
+  // Closing a position = "drop everything on the symbol and exit to cash":
+  // cancel ALL open orders (TP/SL/stale limit orders — including artifacts of
+  // previous attempts) and sell the ENTIRE free coin balance to USDT — not just
+  // the engine's position size, so orphan tranches bought outside the engine
+  // are swept by the same exit. Any throw from here is transient: the engine
+  // keeps the position open and retries the close on the next tick with
+  // attempt+1; on exhausting CC_ORDER_CLOSE_RETRY_ATTEMPTS it force-closes its
+  // own state (fatal exit AFTER the durable teardown — 16.5.x fix).
+  override async onOrderCloseCommit(payload: BrokerOrderClosePayload) {
+    if (payload.backtest) return; // never touch the exchange in backtest mode
+    const { symbol, currentPrice } = payload;
+    const binance  = await getBinance();
+    const coinName = getCoinName(symbol);
+
+    // Step 1: cancel every open order on the symbol (up to CANCEL_ROUNDS sweeps,
+    // individual cancel failures are tolerated — the sweep repeats)
+    {
+      let error;
+      for (let i = 0; i !== CANCEL_ROUNDS; i++) {
+        let isOk = true;
+        const orders = await binance.openOrders(symbol);
+        for (const order of orders) {
+          try {
+            await sleep(1_000);
+            await binance.cancel(symbol, order.orderId);
+            error = null;
+          } catch (e) {
+            isOk = false;
+            error = e;
+            continue;
+          }
+        }
+        if (!orders.length) {
+          error = null;
+          break;
+        }
+        if (isOk) {
+          break;
+        }
+      }
+      if (error) {
+        throw error; // transient — the engine retries the close on the next tick
+      }
+    }
+
+    // Step 2: verify not a single live order is left on the symbol
+    {
+      let error;
+      for (let i = 0; i !== CANCEL_ROUNDS; i++) {
+        try {
+          await sleep(1_000);
+          const { length: hasOrders } = await binance.openOrders(symbol);
+          if (hasOrders) {
+            error = new Error("Order not canceled");
+          } else {
+            error = null;
+            break;
+          }
+        } catch (e) {
+          error = e;
+        }
+      }
+      if (error) {
+        throw error;
+      }
+    }
+
+    // Step 3: exit to cash — sell the ENTIRE free coin balance
+    const account     = await binance.account();
+    const coinBalance = account.balances.find(({ asset }) => asset === coinName);
+    if (!coinBalance) {
+      throw new Error(`Can't fetch balance (close) for ${coinName}`);
+    }
+    const freeQty = parseFloat(coinBalance.free);
+
+    const { minQty } = await getExchangeInfo(symbol, "LOT_SIZE", binance);
+    if (!minQty) {
+      throw new Error(`Can't fetch minimal quantity (close) for ${coinName}`);
+    }
+    const maker = account.makerCommission / 100;
+
+    const quantity = freeQty - percentValue(freeQty, maker) - Number(minQty);
+    if (quantity <= Number(minQty)) {
+      return; // dust — nothing to sell, confirm the close
+    }
+
+    const sellQty   = await formatQuantity(symbol, quantity, binance);
+    const sellPrice = await formatPrice(
+      symbol,
+      currentPrice * TRADE_SELL_LOWER_PERCENT,
+      binance
+    );
+
+    const order = await binance.order("LIMIT", "SELL", symbol, Number(sellQty), Number(sellPrice));
+    if (order.status === "FILLED") {
+      return; // cashed out — the engine records the close
+    }
+
+    // Same wait loop (await + sleep) as on open
+    let last = order;
+    for (let i = 0; i !== FILL_POLL_ATTEMPTS; i++) {
+      await sleep(FILL_POLL_INTERVAL_MS);
+      last = await binance.orderStatus(symbol, order.orderId);
+      if (last.status === "FILLED") {
+        return;
+      }
+    }
+
+    // The limit order did not fill — cancel it and finish the remainder with a
+    // market sell: the cash exit is guaranteed, the position never stays hanging
+    await binance.cancel(symbol, order.orderId);
+    const restQty = await formatQuantity(
+      symbol,
+      Number(sellQty) - Number(last?.executedQty ?? 0),
+      binance
+    );
+    await binance.marketSell(symbol, Number(restQty));
+  }
+
+  // onOrderActiveCheck / onPartial*Commit and the remaining hooks —
+  // as in your current implementation (BrokerBase provides defaults for the rest)
+}
+
+Broker.useBrokerAdapter(SpotBroker);
+Broker.enable();
+```
+
+## Helper function reference
+
+| Function | Source | Description |
+|---|---|---|
+| `roundTicks(value, tickSize)` | inline | Computes decimal precision from `tickSize` (e.g. `"0.01000"` → 2 places) and returns `value.toFixed(precision)`. Handles the trailing-zero format Binance uses in exchange info. |
+| `getExchangeInfo(symbol, filterType, binance)` | inline | Fetches `binance.exchangeInfo()`, extracts the named filter (`LOT_SIZE` or `PRICE_FILTER`) for the given symbol, and returns `{ stepSize, tickSize, minQty }`. Wrapped with `memoize` from `functools-kit` — keyed on `"${symbol}-${filterType}"` so the network round-trip only fires once per symbol per process. |
+| `formatQuantity(symbol, quantity, binance)` | inline | Calls `getExchangeInfo` with `"LOT_SIZE"`, then `roundTicks(quantity, stepSize)`. Ensures the quantity aligns with Binance's lot-size rules. |
+| `formatPrice(symbol, price, binance)` | inline | Calls `getExchangeInfo` with `"PRICE_FILTER"`, then `roundTicks(price, tickSize)`. Ensures the price aligns with tick-size rules. |
+| `getCoinName(symbol)` | inline | Strips `"USDT"` suffix: `"SOLUSDT"` → `"SOL"`. Used to look up the coin in `account.balances`. |
+| `percentValue(value, percent)` | inline | `(value * percent) / 100`. Used to deduct the maker commission from the sell quantity so the order does not fail with insufficient balance. |
+
+## `waitForInit` — startup orphan sweep
+
+```typescript
+override async waitForInit() {
+  await getBinance(); // your singleshot instance
+  // recommended place for an orphan sweep by clientOrderId
+}
+```
+
+`waitForInit` is called once by the engine before any signal is processed. It is the recommended place to perform a startup orphan sweep: query open orders on all tracked symbols and cancel any with a `clientOrderId` that matches a known `signalId` pattern. This ensures any orders left over from a previous crashed run are cleaned up before the engine resumes.
+
+At minimum, `waitForInit` should initialize the Binance singleton so the first real signal does not pay the connection-setup latency.
+
+## CLI dry-fire
+
+Before waiting for a live signal to exercise the adapter, any single hook can be fired against the exchange from the command line:
+
+```bash
+npx @backtest-kit/cli --brokerdebug --commit signal-open --symbol SOLUSDT
+```
+
+This invokes `onOrderOpenCommit` directly with a synthetic payload for `SOLUSDT` — placing a real order on your configured Binance account. Use it to verify keys, quantity formatting, and the poll loop without running a full backtest session.
+
+<Note>
+`--brokerdebug` uses live keys and places real orders. Run it on a funded account with a small `cost` value, or on a Binance testnet if available.
+</Note>
+
+## `BrokerBase` default hooks
+
+`SpotBroker` only overrides `waitForInit`, `onOrderOpenCommit`, and `onOrderCloseCommit`. `BrokerBase` provides safe no-op or pass-through defaults for all remaining hooks:
+
+| Hook | Default behaviour |
+|---|---|
+| `onOrderActiveCheck` | Returns `true` (position is still active) |
+| `onPartialCommit` | No-op |
+| `onOrderOpenSchedule` | No-op (schedule-type signals are ignored) |
+| `onOrderCloseSchedule` | No-op |
+
+Override any of these in your own subclass if your strategy requires partial close tracking, scheduled (resting) order management, or custom activity checks.

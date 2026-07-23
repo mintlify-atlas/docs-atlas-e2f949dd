@@ -1,0 +1,159 @@
+---
+title: "commitTrade: Buy with OCO Take-Profit and Stop-Loss"
+sidebarTitle: "commitTrade"
+description: "commitTrade buys via the commitBuy flow then immediately places an OCO order with a TAKE_PROFIT_LIMIT above and STOP_LOSS_LIMIT below the fill price."
+---
+
+`commitTrade` combines a guarded entry with an automatic bracket in one atomic sequence. It runs the full `commitBuy` flow (limit order, poll loop, market-fallback), measures the quantity delta in the coin balance to determine exactly how many coins were acquired net of fees, and then immediately places an OCO (One-Cancels-the-Other) sell order with a take-profit leg above the fill price and a stop-loss leg below. The call returns only after the OCO is confirmed live on the exchange.
+
+## Signature
+
+```typescript
+commitTrade(
+  symbol: string,
+  amountUSDT: number,
+  takeProfitPrice: number,
+  stopLossPrice: number
+): Promise<0 | { status: string; content: string }>
+```
+
+## Parameters
+
+<ParamField path="symbol" type="string" required>
+  Binance trading pair symbol, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="amountUSDT" type="number" required>
+  Amount in USDT to spend on the entry buy. Subject to the same guards as `commitBuy` — open orders or insufficient balance cause an early return of `0`.
+</ParamField>
+
+<ParamField path="takeProfitPrice" type="number" required>
+  The target price at which to take profit. Must be a valid finite number `> 0` and strictly **greater than** the current average price at call time. The OCO above leg is placed at `takeProfitPrice × 1.001` (limit price) with `takeProfitPrice` as the stop trigger price.
+</ParamField>
+
+<ParamField path="stopLossPrice" type="number" required>
+  The price at which to cut the loss. Must be a valid finite number `> 0` and strictly **less than** the current average price at call time. The OCO below leg is placed at `stopLossPrice × 0.999` (limit price) with `stopLossPrice` as the stop trigger price.
+</ParamField>
+
+## Return value
+
+`Promise<0 | { status: string; content: string }>`
+
+- `0` — guards prevented the buy (open orders exist on symbol, or free USDT < `amountUSDT`).
+- `{ status: "ok", content: string }` — the full trade was entered and the OCO is live. `content` is a human-readable report string.
+
+## Validation
+
+`WalletPublicService.commitTrade` performs strict pre-flight validation before enqueuing the operation:
+
+```typescript
+// Price hierarchy: takeProfitPrice > currentAvgPrice > stopLossPrice
+if (stopLossPrice > takeProfitPrice)
+  throw new Error("stop-loss price is greater than take-profit price");
+if (takeProfitPrice <= averagePrice)
+  throw new Error("take-profit price must be greater than average price");
+if (stopLossPrice >= averagePrice)
+  throw new Error("stop-loss price must be less than average price");
+if (stopLossPrice <= 0)
+  throw new Error("stop-loss price must be greater than zero");
+if (takeProfitPrice <= 0)
+  throw new Error("take-profit price must be greater than zero");
+// NaN / non-number checks on all three price inputs
+```
+
+All prices must satisfy `takeProfitPrice > currentPrice > stopLossPrice > 0`.
+
+## Execution flow
+
+<Steps>
+  <Step title="Pre-flight guards">
+    Calls `binance.openOrders(symbol)` — returns `0` if any open order exists. Reads free USDT balance — returns `0` if `balance < amountUSDT`.
+  </Step>
+  <Step title="Snapshot balance before buy">
+    Calls `FETCH_BALANCE_FN` to record the coin balance before entry. This baseline is used to compute the actual quantity acquired.
+  </Step>
+  <Step title="Enter via commitBuy flow">
+    Runs `COMMIT_BUY_FN` with the validated `amountUSDT` and `averagePrice`. This places a limit BUY at `averagePrice × 1.001`, polls up to 100s, and market-buys any unfilled remainder on timeout.
+  </Step>
+  <Step title="Measure quantity delta">
+    Snapshots the balance again after the buy. Net quantity = `balanceAfter.quantity - balanceBefore.quantity`. Subtracts the maker fee percentage and `minQty` dust:
+    ```typescript
+    orderQuantity = balanceAfter.quantity - balanceBefore.quantity;
+    orderQuantity = orderQuantity - percentValue(orderQuantity, maker);
+    orderQuantity = orderQuantity - minQty;
+    ```
+  </Step>
+  <Step title="Place OCO sell order">
+    Places the OCO via `binance.ocoOrder("SELL", symbol, qty, params)` with the following parameters:
+    ```typescript
+    {
+      belowType: "STOP_LOSS_LIMIT",
+      belowPrice: stopLossPrice * 0.999,     // limit fill price for stop leg
+      belowStopPrice: stopLossPrice,          // trigger price
+      belowTimeInForce: "GTC",
+
+      aboveType: "TAKE_PROFIT_LIMIT",
+      aboveStopPrice: takeProfitPrice,        // trigger price
+      abovePrice: takeProfitPrice * 1.001,    // limit fill price for take-profit leg
+      aboveTimeInForce: "GTC",
+    }
+    ```
+    All prices are formatted to the symbol's `PRICE_FILTER` `tickSize`.
+  </Step>
+  <Step title="Verify OCO is live">
+    Polls `binance.openOrders(symbol)` up to 10 times (1s sleep each) until at least one open order appears. Throws if the book remains empty after all retries — this would indicate the OCO was not registered by the exchange.
+  </Step>
+</Steps>
+
+## Success report
+
+On a successful trade, `content` contains a multi-line summary:
+
+```
+Bot bought SOLUSDT (qty 0.23) at price 79.50 (18.29$)
+and placed an OCO order (take profit + stop loss):
+- Take Profit: 85.00 (19.55$)
+- Stop Loss: 74.00 (17.02$)
+Date/time: 1/15/2025 14:32:10
+```
+
+## Audit log
+
+After completion, `WalletPublicService` emits:
+
+```typescript
+console.log({
+  symbol,
+  action: "trade",
+  amountUSDT,
+  averagePrice,
+  takeProfitPrice,
+  stopLossPrice,
+  date: new Date(),
+  status: "success" | "failed",
+});
+```
+
+## Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// REPL usage:
+// repl => await wallet.walletPublicService.commitTrade("SOLUSDT", 20, 85.0, 74.0)
+
+const result = await walletPublicService.commitTrade("SOLUSDT", 20, 85.0, 74.0);
+
+if (result === 0) {
+  console.log("Guards prevented entry: open orders exist or insufficient balance");
+} else {
+  console.log("Trade opened:", result.status);
+  console.log(result.content);
+}
+```
+
+<Warning>
+  All prices must satisfy `takeProfitPrice > currentMarketPrice > stopLossPrice > 0`. The current market price is fetched by `WalletPublicService` before enqueuing — if the price moves significantly while waiting in the queue, the validation snapshot may be stale. Always verify the price hierarchy before calling `commitTrade`.
+</Warning>

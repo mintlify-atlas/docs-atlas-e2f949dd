@@ -1,0 +1,558 @@
+---
+title: "Core Functions: Low-Level Order and Fetch Primitives"
+sidebarTitle: "Core Functions"
+description: "The commit_* and fetch_* functions are the low-level primitives underlying WalletPublicService, accepting a Binance instance directly for use in custom broker adapters."
+---
+
+## Overview
+
+The `commit_*` and `fetch_*` functions are the actual order-management and data-retrieval primitives that `WalletPrivateService` delegates to. Unlike the higher-level `WalletPublicService` (which adds per-symbol queuing, argument validation, and structured audit logging), these functions accept a `Binance` instance directly as their second argument — making them usable in any broker adapter without the full DI stack.
+
+<Note>
+  Every `commit_*` call places **real orders on Binance spot**. There is no
+  dry-run mode. Exchange info (LOT\_SIZE, PRICE\_FILTER) is memoized per symbol
+  across all calls in a process lifetime.
+</Note>
+
+---
+
+## commit\_buy
+
+### `COMMIT_BUY_FN`
+
+```typescript
+COMMIT_BUY_FN(
+  { symbol, amountUSDT, averagePrice }: IParams,
+  binance: Binance
+): Promise<number>
+```
+
+Places a guarded limit BUY order. Returns `0` without trading when pre-conditions fail, otherwise returns the average fill price.
+
+**Guards (returns `0` immediately if either condition is true):**
+- The symbol already has open orders (`binance.openOrders(symbol).length > 0`)
+- Free USDT balance is below `amountUSDT`
+
+**Order flow:**
+1. Formats quantity via `LOT_SIZE` stepSize and price via `PRICE_FILTER` tickSize using [`roundTicks`](/api/utilities#roundticks).
+2. Places a `LIMIT BUY` at `averagePrice × 1.001` (slightly above market to maximize fill speed).
+3. If the order fills immediately → returns the average fill price from the fills array.
+4. Otherwise polls `binance.orderStatus` **10 × 10s** (up to ~100 seconds).
+5. On timeout: cancels the limit order, then `marketBuy`s the unfilled remainder (`quantity − executedQty`).
+6. Returns the average fill price across all fills, falling back to the formatted order price if fills are absent.
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="amountUSDT" type="number" required>
+  The USDT amount to spend. Converted to coin quantity via `usdToCoins(amountUSDT, averagePrice)`.
+</ParamField>
+
+<ParamField path="averagePrice" type="number" required>
+  Reference price used to compute the limit price (`× 1.001`) and to convert USDT to coin quantity.
+</ParamField>
+
+<ParamField path="binance" type="Binance" required>
+  A configured `node-binance-api` instance with API key and secret.
+</ParamField>
+
+**Returns:** `Promise<number>` — average fill price, or `0` if guards fired.
+
+**Example — broker adapter using `COMMIT_BUY_FN` directly:**
+
+```typescript
+import Binance from "node-binance-api";
+import { COMMIT_BUY_FN } from "./src/function/commit_buy.function";
+
+const binance = new Binance().options({
+  APIKEY: process.env.CC_BINANCE_API_KEY,
+  APISECRET: process.env.CC_BINANCE_API_SECRET,
+});
+
+// Place a guarded 20 USDT limit BUY on SOLUSDT at the current market price
+const fillPrice = await COMMIT_BUY_FN(
+  { symbol: "SOLUSDT", amountUSDT: 20, averagePrice: 77.56 },
+  binance
+);
+
+if (fillPrice === 0) {
+  console.log("Buy skipped: open orders exist or insufficient USDT balance.");
+} else {
+  console.log(`Filled at average price: ${fillPrice}`);
+}
+```
+
+---
+
+## commit\_sell
+
+### `COMMIT_SELL_FN`
+
+```typescript
+COMMIT_SELL_FN(
+  { symbol, amountUSDT, averagePrice }: IParams,
+  binance: Binance
+): Promise<number>
+```
+
+Places a limit SELL order for `amountUSDT` worth of the coin. Unlike `COMMIT_BUY_FN`, this function has **no pre-condition guards** — it always attempts to place the order.
+
+**Order flow:**
+1. Formats quantity via `LOT_SIZE` stepSize and price via `PRICE_FILTER` tickSize.
+2. Places a `LIMIT SELL` at `averagePrice × 0.999` (slightly below market to improve fill speed).
+3. If the order fills immediately → returns the average fill price.
+4. Otherwise polls `binance.orderStatus` **10 × 10s**.
+5. On timeout: cancels the limit order, then `marketSell`s the unfilled remainder (`quantity − executedQty`).
+6. Returns the average fill price.
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="amountUSDT" type="number" required>
+  The USDT-denominated amount of coin to sell. Converted to coin quantity via `usdToCoins(amountUSDT, averagePrice)`.
+</ParamField>
+
+<ParamField path="averagePrice" type="number" required>
+  Reference price used to compute the limit price (`× 0.999`) and to convert USDT to coin quantity.
+</ParamField>
+
+<ParamField path="binance" type="Binance" required>
+  A configured `node-binance-api` instance.
+</ParamField>
+
+**Returns:** `Promise<number>` — average fill price.
+
+**Example:**
+
+```typescript
+import { COMMIT_SELL_FN } from "./src/function/commit_sell.function";
+
+// Sell 20 USDT worth of SOL at ~77.40 (0.999 × 77.56)
+const fillPrice = await COMMIT_SELL_FN(
+  { symbol: "SOLUSDT", amountUSDT: 20, averagePrice: 77.56 },
+  binance
+);
+console.log(`Sold at average price: ${fillPrice}`);
+```
+
+---
+
+## commit\_cancel
+
+### `COMMIT_CANCEL_FN`
+
+```typescript
+COMMIT_CANCEL_FN(
+  { symbol, averagePrice }: IParams,
+  binance: Binance
+): Promise<number>
+```
+
+Flattens the symbol to cash: cancels **all** open orders, verifies a clean order book, then sells the **entire** free coin balance to USDT. Returns `0` if remaining balance is below `minQty` (dust), otherwise returns the average exit price.
+
+<Note>
+  This is the canonical "cancel-first, sell-second" sequence. Attempting to
+  sell while funds are still frozen in a pending order will either fail with an
+  insufficient-balance error or silently trade only the unlocked remainder —
+  leaving the other orders alive on the book. `COMMIT_CANCEL_FN` prevents this
+  by verifying zero open orders before touching the balance.
+</Note>
+
+**Three-step flow:**
+
+**Step 1 — Cancel sweep (up to 10 rounds):**
+- Fetches all open orders for the symbol.
+- Iterates each order, calling `binance.cancel` with a 1s sleep between each.
+- Individual cancel errors are tolerated; the round is retried.
+- Exits the sweep early when `openOrders` returns an empty array.
+- Throws if the final round still has errors.
+
+**Step 2 — Clean-book verification (up to 10 rounds):**
+- Polls `binance.openOrders(symbol)` every 1s.
+- Throws `Error("Order not canceled")` if any orders remain after 10 checks.
+
+**Step 3 — Exit to cash:**
+- Calls `FETCH_BALANCE_FN` to get the free coin balance.
+- Deducts maker commission: `quantity − percentValue(quantity, maker) − minQty`.
+- If the resulting quantity ≤ `minQty` → returns `0` (dust, nothing to sell).
+- Places a `LIMIT SELL` at `averagePrice × 0.999`, with the same 10 × 10s poll loop and cancel + `marketSell` fallback on timeout.
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="averagePrice" type="number" required>
+  Reference price used to compute the limit sell price (`× 0.999`).
+</ParamField>
+
+<ParamField path="binance" type="Binance" required>
+  A configured `node-binance-api` instance.
+</ParamField>
+
+**Returns:** `Promise<number>` — average exit price, or `0` if balance is dust.
+
+**Example:**
+
+```typescript
+import { COMMIT_CANCEL_FN } from "./src/function/commit_cancel.function";
+
+// Flatten the entire SOLUSDT position to cash
+const exitPrice = await COMMIT_CANCEL_FN(
+  { symbol: "SOLUSDT", averagePrice: 77.56 },
+  binance
+);
+
+if (exitPrice === 0) {
+  console.log("Nothing sold — balance was below minQty (dust).");
+} else {
+  console.log(`Exited at average price: ${exitPrice}`);
+}
+```
+
+---
+
+## commit\_trade
+
+### `COMMIT_TRADE_FN`
+
+```typescript
+COMMIT_TRADE_FN(
+  { symbol, amountUSDT, averagePrice, takeProfitPrice, stopLossPrice }: IParams,
+  binance: Binance
+): Promise<0 | { status: string; content: string }>
+```
+
+Entry + OCO brackets in a single call. Buys via `COMMIT_BUY_FN`, measures the quantity delta (balance after minus balance before), then places an OCO sell order with a take-profit limit and a stop-loss limit. Returns `0` if guards fired, otherwise a report object.
+
+**Guards (returns `0` immediately if either condition is true):**
+- The symbol already has open orders.
+- Free USDT balance is below `amountUSDT`.
+
+**Order flow:**
+1. Fetches balance before buy (`balanceBefore`).
+2. Calls `COMMIT_BUY_FN` to enter the position.
+3. Fetches balance after buy (`balanceAfter`).
+4. Computes `orderQuantity = (balanceAfter.quantity − balanceBefore.quantity) − percentValue(orderQuantity, maker) − minQty`.
+5. Throws if `orderQuantity` is non-finite, NaN, or ≤ 0.
+6. Waits 1s, then places an OCO SELL via `binance.ocoOrder`:
+
+   | Leg | Type | Price field |
+   |-----|------|-------------|
+   | Below (stop-loss) | `STOP_LOSS_LIMIT` | `stopLossPrice` (trigger) / `stopLossPrice × 0.999` (limit) |
+   | Above (take-profit) | `TAKE_PROFIT_LIMIT` | `takeProfitPrice` (trigger) / `takeProfitPrice × 1.001` (limit) |
+
+   Both legs use `GTC` time-in-force.
+
+7. Verifies the OCO was accepted by polling `openOrders` **10 × 1s**. Throws `Error("Order not created")` if no open orders appear.
+8. Returns a human-readable report:
+
+   ```
+   { status: "ok", content: "<Russian-language summary of symbol, quantity, entry price, TP, SL, timestamp>" }
+   ```
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="amountUSDT" type="number" required>
+  USDT amount to spend on the entry buy.
+</ParamField>
+
+<ParamField path="averagePrice" type="number" required>
+  Reference price passed through to `COMMIT_BUY_FN`.
+</ParamField>
+
+<ParamField path="takeProfitPrice" type="number" required>
+  Price at which the take-profit limit leg fires.
+</ParamField>
+
+<ParamField path="stopLossPrice" type="number" required>
+  Price at which the stop-loss limit leg fires.
+</ParamField>
+
+<ParamField path="binance" type="Binance" required>
+  A configured `node-binance-api` instance.
+</ParamField>
+
+**Returns:** `Promise<0 | { status: string; content: string }>` — `0` on guard failure, otherwise a report object with `status: "ok"` and a `content` summary string.
+
+**Example:**
+
+```typescript
+import { COMMIT_TRADE_FN } from "./src/function/commit_trade.function";
+
+const result = await COMMIT_TRADE_FN(
+  {
+    symbol: "SOLUSDT",
+    amountUSDT: 20,
+    averagePrice: 77.56,
+    takeProfitPrice: 85.0,
+    stopLossPrice: 74.0,
+  },
+  binance
+);
+
+if (result === 0) {
+  console.log("Trade skipped: open orders exist or insufficient USDT.");
+} else {
+  console.log(result.content);
+  // "Бот купил SOLUSDT (в размере 0.25) по цене 77.56 (19.39$) и выставил OCO ордер ..."
+}
+```
+
+---
+
+## fetch\_balance
+
+### `FETCH_BALANCE_FN`
+
+```typescript
+FETCH_BALANCE_FN(binance: Binance): Promise<Record<string, { usdt: number; quantity: number }>>
+```
+
+Returns a balance snapshot for all coins in the hardcoded `SYMBOL_LIST`. Each entry reflects both free and on-order (locked in open orders) quantities, converted to USDT at the current market price.
+
+**Hardcoded coin list (derived from `SYMBOL_LIST`):**
+
+```typescript
+const SYMBOL_LIST = [
+  "BTCUSDT",
+  "POLUSDT",
+  "ZECUSDT",
+  "HYPEUSDT",
+  "DOGEUSDT",
+  "SOLUSDT",
+  "PENGUUSDT",
+  "TRXUSDT",
+  "HBARUSDT",
+  "NEARUSDT",
+  "FARTCOINUSDT",
+  "ETHUSDT",
+  "PUMPUSDT",
+];
+```
+
+For each symbol, the coin name is derived by stripping `"USDT"` (e.g. `"SOLUSDT"` → `"SOL"`). The function sums `registry[coinName].available + registry[coinName].onOrder` from `binance.balance()`, then multiplies by the current price from `binance.prices()`.
+
+<ParamField path="binance" type="Binance" required>
+  A configured `node-binance-api` instance.
+</ParamField>
+
+**Returns:** `Promise<Record<string, { usdt: number; quantity: number }>>` — keyed by coin name (e.g. `"SOL"`, `"BTC"`).
+
+**Example:**
+
+```typescript
+import { FETCH_BALANCE_FN } from "./src/function/fetch_balance.function";
+
+const balances = await FETCH_BALANCE_FN(binance);
+// {
+//   SOL: { quantity: 0.25, usdt: 19.39 },
+//   BTC: { quantity: 0,    usdt: 0 },
+//   ETH: { quantity: 0,    usdt: 0 },
+//   ...
+// }
+console.log(`SOL balance: ${balances.SOL.quantity} SOL (${balances.SOL.usdt} USDT)`);
+```
+
+---
+
+## fetch\_price
+
+### `FETCH_PRICE_FN`
+
+```typescript
+FETCH_PRICE_FN({ symbol }: IParams, binance: Binance): Promise<number>
+```
+
+Returns the 5-minute weighted average price for a symbol, formatted to the exchange's `PRICE_FILTER` tickSize precision.
+
+**Internally calls `binance.avgPrice(symbol)`**, which returns Binance's built-in 5-minute weighted average price. The raw float is then passed through `formatPrice` → `roundTicks` to match the symbol's tick precision before being returned as a number.
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="binance" type="Binance" required>
+  A configured `node-binance-api` instance.
+</ParamField>
+
+**Returns:** `Promise<number>` — average price rounded to the symbol's tick precision.
+
+**Example:**
+
+```typescript
+import { FETCH_PRICE_FN } from "./src/function/fetch_price.function";
+
+const price = await FETCH_PRICE_FN({ symbol: "SOLUSDT" }, binance);
+console.log(price); // e.g. 77.56
+```
+
+---
+
+## fetch\_fiat
+
+### `FETCH_FIAT_FN`
+
+```typescript
+FETCH_FIAT_FN(binance: Binance): Promise<number>
+```
+
+Returns the total USDT balance — both free and locked (in open orders) — from the Binance spot account.
+
+Calls `binance.account()` and locates the `USDT` entry in `account.balances`. Returns `parseFloat(free) + parseFloat(locked)`. Returns `0` if no USDT balance entry is found.
+
+<ParamField path="binance" type="Binance" required>
+  A configured `node-binance-api` instance.
+</ParamField>
+
+**Returns:** `Promise<number>` — total USDT (free + locked), or `0` if the account holds no USDT.
+
+**Example:**
+
+```typescript
+import { FETCH_FIAT_FN } from "./src/function/fetch_fiat.function";
+
+const totalUsdt = await FETCH_FIAT_FN(binance);
+console.log(`Total USDT (free + locked): ${totalUsdt}`);
+```
+
+---
+
+## fetch\_orders
+
+### `FETCH_ORDERS_FN`
+
+```typescript
+FETCH_ORDERS_FN(
+  { symbol, limit }: IParams,
+  binance: Binance
+): Promise<IOrderData[]>
+```
+
+Returns a combined, time-sorted list of orders for a symbol: currently open (pending) orders first, followed by historical trade records (filled and canceled), up to `limit` historical entries.
+
+**`IOrderData` shape:**
+
+```typescript
+interface IOrderData {
+  symbol: string;
+  orderId: number;
+  status: "FILLED" | "CANCELED" | "NEW";
+  amount: string;       // origQty
+  executedQty: string;
+  price: string;
+  time: string;         // ISO 8601
+  side: "BUY" | "SELL";
+}
+```
+
+**Internally:**
+- Historical orders are iterated via `binance.trades(symbol)` using `iterateDocuments` / `resolveDocuments` from `functools-kit` to handle pagination. Results are deduplicated by `orderId`.
+- Each unique trade `orderId` is enriched with full order details via `binance.orderStatus`, using an `execpool`-throttled concurrency pool with a 100ms sleep per request.
+- Open orders are fetched via `binance.openOrders(symbol)`.
+- The combined list is returned with pending orders at the top, followed by historical orders sorted newest-first.
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="limit" type="number" required>
+  Maximum number of historical (non-pending) orders to return.
+</ParamField>
+
+<ParamField path="binance" type="Binance" required>
+  A configured `node-binance-api` instance.
+</ParamField>
+
+**Returns:** `Promise<IOrderData[]>` — open orders first (status `"NEW"`), then historical orders sorted newest-first.
+
+**Example:**
+
+```typescript
+import { FETCH_ORDERS_FN } from "./src/function/fetch_orders.function";
+
+const orders = await FETCH_ORDERS_FN({ symbol: "SOLUSDT", limit: 25 }, binance);
+
+for (const order of orders) {
+  console.log(`[${order.time}] ${order.side} ${order.executedQty} @ ${order.price} — ${order.status}`);
+}
+```
+
+---
+
+## fetch\_pnl
+
+### `FETCH_PNL_FN`
+
+```typescript
+FETCH_PNL_FN(
+  { orders, symbol }: IParams,
+  binance: Binance
+): Promise<IDailyPnL[]>
+```
+
+Reconstructs daily profit-and-loss from a pre-fetched orders array. Uses partial-fill matching (FIFO buy-sell pairing) with VWAP computed from 1-hour candles as the daily average price reference.
+
+**`IDailyPnL` shape:**
+
+```typescript
+interface IDailyPnL {
+  date: string;         // ISO 8601 date of the trading day
+  pnl: string;          // realized PnL for the day, formatted to tickSize
+  walletCost: string;   // average buy cost of matched trades (VWAP of buys), formatted to tickSize
+  amountQty: string;    // cumulative coin balance at end of day, formatted to stepSize
+  amountUSDT: string;   // amountQty × daily VWAP, formatted to tickSize
+  averagePrice: string; // daily VWAP from 1h candles, formatted to tickSize
+}
+```
+
+**Algorithm:**
+
+1. Filters `orders` to `status === "FILLED"` only.
+2. Groups filled orders into `dayGroups` keyed by a day stamp (`getMomentStamp`). Each group has `buys[]` and `sells[]` arrays of `ProcessedOrder`.
+3. Tracks a running `cumulativeBalance` (quantity held) across all orders chronologically to populate `balanceByDay`.
+4. For each day's buys, runs `processPartialMatching` against the current day's sells **plus all future days' sells** (supporting cross-day trades). Uses a `usedSells` map to track remaining quantity across partial fills:
+   - `pnl = (sellPrice − buyPrice) × tradeQty` accumulated per sell-day.
+   - `totalCostByDay` and `totalQtyByDay` accumulate the buy-side cost for `walletCost` computation.
+5. For each day with non-zero PnL, calls `getAvgPriceForDay` which fetches `1h` candles via `binance.candles` and computes VWAP: `Σ(close × volume) / Σ(volume)`.
+6. All prices and quantities are formatted to exchange precision before inclusion in the result.
+
+<Note>
+  `FETCH_PNL_FN` accepts a pre-fetched `orders` array (the output of
+  `FETCH_ORDERS_FN`) rather than fetching orders itself. Fetch orders once and
+  pass the result here to avoid redundant API calls.
+</Note>
+
+<ParamField path="orders" type="IOrderData[]" required>
+  Pre-fetched orders array, typically from `FETCH_ORDERS_FN`. Only `FILLED` orders are processed.
+</ParamField>
+
+<ParamField path="symbol" type="string" required>
+  Trading pair symbol used to fetch 1h VWAP candles and to format prices/quantities.
+</ParamField>
+
+<ParamField path="binance" type="Binance" required>
+  A configured `node-binance-api` instance.
+</ParamField>
+
+**Returns:** `Promise<IDailyPnL[]>` — one entry per day that has realized PnL, sorted newest-first.
+
+**Example:**
+
+```typescript
+import { FETCH_ORDERS_FN } from "./src/function/fetch_orders.function";
+import { FETCH_PNL_FN } from "./src/function/fetch_pnl";
+
+// Step 1: fetch recent order history
+const orders = await FETCH_ORDERS_FN({ symbol: "SOLUSDT", limit: 50 }, binance);
+
+// Step 2: compute daily PnL from those orders
+const pnlHistory = await FETCH_PNL_FN({ orders, symbol: "SOLUSDT" }, binance);
+
+for (const day of pnlHistory) {
+  console.log(`${day.date}: PnL = ${day.pnl} USDT | Avg price = ${day.averagePrice} | Holdings = ${day.amountQty} (${day.amountUSDT} USDT)`);
+}
+```

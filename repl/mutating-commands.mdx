@@ -1,0 +1,181 @@
+---
+title: "REPL Mutating Commands: Buy, Sell, and Flatten Positions"
+sidebarTitle: "Mutating Commands"
+description: "Use commitBuy, commitSell, commitTrade, and commitCancel to place and manage real Binance spot orders from the REPL with guaranteed-fill logic."
+---
+
+<Warning>
+  **Live keys, real money.** Every `commit*` call places real orders on Binance spot. There is no dry-run or paper-trading mode. Double-check symbol, amount, and price arguments before pressing Enter.
+</Warning>
+
+All four commands are accessed through `wallet.walletPublicService`, which wraps each call in a per-symbol serialized execution queue, validates arguments, clears internal caches after completion, and prints a structured audit log entry to `console.log` when the call resolves.
+
+---
+
+## commitBuy
+
+Places a **guarded limit BUY** for `amountUSDT` worth of the base coin. Returns `0` immediately — without touching the exchange — when the symbol already has open orders or when free USDT is below `amountUSDT`.
+
+<ParamField path="symbol" type="string" required>
+  The Binance trading pair, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="amountUSDT" type="number" required>
+  The USDT amount to spend. Must be a positive finite number; the service throws on `NaN` or negative values.
+</ParamField>
+
+**Return type:** `Promise<number>` — the average fill price, or `0` if the buy was skipped.
+
+**Order flow:**
+
+1. Fetches the current average price.
+2. Checks for open orders on the symbol and checks free USDT balance — returns `0` if either guard fails.
+3. Places a limit BUY at **`avgPrice × 1.001`** (slightly above market to improve fill speed).
+4. Polls the order status every **10 seconds**, up to **10 times** (~100 seconds total).
+5. If the order is still not fully filled after the poll loop: **cancels the limit order** and **market-buys the unfilled remainder** — the entry is guaranteed to complete; no resting order is left on the book.
+6. Returns the average fill price.
+
+**REPL example:**
+
+```
+repl => await wallet.walletPublicService.commitBuy("SOLUSDT", 20)
+77.64
+```
+
+If guards fire (e.g. insufficient USDT):
+
+```
+repl => await wallet.walletPublicService.commitBuy("SOLUSDT", 5000)
+0
+```
+
+---
+
+## commitSell
+
+Places a **limit SELL** for `amountUSDT` worth of the base coin with the same poll-loop and market-sell fallback as `commitBuy`.
+
+<ParamField path="symbol" type="string" required>
+  The Binance trading pair, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="amountUSDT" type="number" required>
+  The USDT-equivalent value of coin to sell. Must be a positive finite number.
+</ParamField>
+
+**Return type:** `Promise<number>` — the average fill price.
+
+**Order flow:**
+
+1. Fetches the current average price.
+2. Places a limit SELL at **`avgPrice × 0.999`** (slightly below market to improve fill speed).
+3. Polls every **10 seconds**, up to **10 times**.
+4. On timeout: cancels the limit order and **market-sells the remainder** — the exit is guaranteed.
+5. Returns the average fill price.
+
+**REPL example:**
+
+```
+repl => await wallet.walletPublicService.commitSell("SOLUSDT", 20)
+77.49
+```
+
+---
+
+## commitTrade
+
+**Entry + brackets in one call.** Validates the price triangle, buys via the `commitBuy` flow, then immediately protects the position with an **OCO sell** (TAKE_PROFIT_LIMIT + STOP_LOSS_LIMIT).
+
+<ParamField path="symbol" type="string" required>
+  The Binance trading pair.
+</ParamField>
+
+<ParamField path="amountUSDT" type="number" required>
+  The USDT amount to spend on the entry buy.
+</ParamField>
+
+<ParamField path="takeProfitPrice" type="number" required>
+  The price at which the take-profit limit order will trigger. Must be strictly greater than the current average price.
+</ParamField>
+
+<ParamField path="stopLossPrice" type="number" required>
+  The price at which the stop-loss limit order will trigger. Must be strictly less than the current average price and greater than zero.
+</ParamField>
+
+**Return type:** `Promise<0 | { status: string; content: string }>` — `0` if the entry buy returned `0` (guard fired); otherwise a status report object from the OCO placement.
+
+**Validation (all checked before touching the exchange):**
+
+| Condition | Error thrown |
+|---|---|
+| `stopLossPrice > takeProfitPrice` | `"stop-loss price is greater than take-profit price"` |
+| `takeProfitPrice <= avgPrice` | `"take-profit price must be greater than average price"` |
+| `stopLossPrice >= avgPrice` | `"stop-loss price must be less than average price"` |
+| `stopLossPrice <= 0` | `"stop-loss price must be greater than zero"` |
+| `takeProfitPrice <= 0` | `"take-profit price must be greater than zero"` |
+| Either price arg is `NaN` or non-number | Validation error |
+
+**REPL example:**
+
+```
+repl => await wallet.walletPublicService.commitTrade("SOLUSDT", 20, 85.0, 74.0)
+{
+  "status": "OK",
+  "content": "OCO order placed: TP 85.00 / SL 74.00"
+}
+```
+
+The command is equivalent to:
+1. `commitBuy("SOLUSDT", 20)` — fills at market-adjacent price.
+2. Place OCO SELL at `takeProfitPrice` (TAKE_PROFIT_LIMIT) and `stopLossPrice` (STOP_LOSS_LIMIT) for the quantity acquired.
+
+---
+
+## commitCancel
+
+**Flatten the symbol — cancel everything and exit to cash.** This is the emergency or planned exit command. It cancels **all** open orders on the symbol first, verifies the order book is clean, then sells the **entire free coin balance** to USDT.
+
+<ParamField path="symbol" type="string" required>
+  The Binance trading pair to flatten.
+</ParamField>
+
+**Return type:** `Promise<number>` — the average fill price of the closing sell, or `0` if the free coin balance was below `minQty` (dust, nothing to sell).
+
+**REPL example:**
+
+```
+repl => await wallet.walletPublicService.commitCancel("SOLUSDT")
+77.33
+```
+
+If only dust remains:
+
+```
+repl => await wallet.walletPublicService.commitCancel("SOLUSDT")
+0
+```
+
+<Steps>
+  <Step title="Sweep open orders (up to 10 rounds)">
+    Fetches all open orders for the symbol. Iterates through them, canceling one by one with a 1-second pause between each cancel. Individual cancel failures are tolerated — the sweep loop continues. Repeats up to **10 rounds** until no open orders remain or all individual cancels succeed in a single pass.
+  </Step>
+  <Step title="Verify book is clean">
+    Calls `openOrders(symbol)` up to 10 times (1-second intervals). If any open orders still remain after all retries, throws a transient error — the operation does not proceed to the sell step.
+  </Step>
+  <Step title="Check free coin balance">
+    Reads the account balance for the base coin. If the free quantity (minus maker commission and `minQty` buffer) is at or below `minQty`, returns `0` — dust is left untouched.
+  </Step>
+  <Step title="Place limit SELL for entire free balance">
+    Places a limit SELL at **`avgPrice × 0.999`** for the full free coin quantity (minus commission buffer). The limit price is slightly below market to maximise fill probability.
+  </Step>
+  <Step title="Poll for fill (up to 10 × 10s)">
+    Checks the order status every **10 seconds**, up to **10 times**. Returns the fill price as soon as the order is confirmed `FILLED`.
+  </Step>
+  <Step title="Market-sell fallback">
+    If the limit order is still open after the poll loop, **cancels it** and **market-sells the unfilled remainder**. The cash exit is guaranteed — the position never stays hanging on the book.
+  </Step>
+</Steps>
+
+<Note>
+  The "cancel everything first, then sell" sequence is not optional. On Binance spot, every resting order locks its quantity (base coin for a SELL, USDT for a BUY). Selling into a lock silently reduces the fill or fails with insufficient balance. `commitCancel` always clears and verifies the order book before posting the closing sell.
+</Note>

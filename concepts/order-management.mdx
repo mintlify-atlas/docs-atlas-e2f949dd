@@ -1,0 +1,272 @@
+---
+title: "Order Management: The Cancel-Before-Sell Sequence"
+sidebarTitle: "Order Management"
+description: "Wallet Manager encodes the correct Binance spot order sequence: cancel pending orders, verify a clean book, then sell — preventing insufficient-balance errors from locked funds."
+---
+
+## The Core Problem: Locked Funds on Binance Spot
+
+On Binance spot, every resting order **locks the quantity it requires**:
+
+- A **SELL** order locks the base coin (e.g. SOL in SOLUSDT) equal to the sell quantity.
+- A **BUY** order locks USDT equal to `quantity × price`.
+
+Those locked amounts are reported as `onOrder` in the account balance — they are not available as `free`. If you attempt to sell a coin while a SELL or OCO order on that symbol is still live, one of two things happens:
+
+1. The request fails immediately with an **insufficient balance** error.
+2. Worse: it silently succeeds but only trades the _unlocked_ remainder — leaving your TP/SL/stale entry orders holding the rest.
+
+This is the single most common mistake in broker-adapter implementations: calling sell without first clearing the order book.
+
+<Note>
+  The `commitCancel` function and the `onOrderCloseCommit` broker-adapter
+  example both follow the same safe three-step sequence to guarantee a clean
+  exit every time.
+</Note>
+
+---
+
+## The Correct Sequence
+
+<Steps>
+  <Step title="Cancel ALL open orders on the symbol">
+    Fetch `openOrders(symbol)` and cancel each one individually. Individual
+    cancel failures are tolerated — the sweep retries up to **10 rounds**. This
+    handles race conditions where an order fills between the fetch and the
+    cancel.
+
+    The loop exits as soon as one full sweep completes with no errors, or
+    after 10 rounds. If the last error is non-null after all rounds, it is
+    re-thrown so the caller (e.g. the broker adapter's close hook) can retry
+    the entire close operation.
+  </Step>
+
+  <Step title="Verify the order book is clean">
+    Even after every cancel call succeeds, Binance may still briefly show the
+    orders as open while the cancellation propagates. A second polling loop
+    calls `openOrders(symbol)` up to **10 times** (with a 1-second delay
+    between each) and waits until `length === 0`.
+
+    Only when the book is confirmed empty does execution proceed to the sell
+    step.
+  </Step>
+
+  <Step title="Sell the free coin balance">
+    With no resting orders, the full coin balance is `free`. A limit SELL is
+    placed at `price × 0.999` (slightly below market to fill faster). The
+    order is then polled every 10 seconds for up to 10 iterations (~100
+    seconds total). If it does not fill, the limit order is cancelled and the
+    remainder is **market-sold** — guaranteeing a complete cash exit.
+  </Step>
+</Steps>
+
+---
+
+## The Poll-with-Timeout-and-Market-Fallback Pattern
+
+All three commit functions (`commitBuy`, `commitSell`, `commitCancel`) share
+the same fill-polling pattern to ensure **no order is ever left resting on
+the book**:
+
+```
+Place limit order
+  │
+  ├─ status === FILLED immediately? → return averagePrice
+  │
+  └─ else: poll every 10 seconds, up to 10 times
+       │
+       ├─ FILLED during poll? → return averagePrice
+       │
+       └─ Timeout (10 × 10s ≈ 100s):
+            cancel the limit order
+            market-sell (or market-buy) the unfilled remainder
+            return averagePrice from market fill
+```
+
+<Tip>
+  The market fallback is unconditional — it runs even if the limit order
+  partially filled. The remainder quantity is calculated as
+  `original quantity - executedQty`, so only the unfilled portion hits the
+  market.
+</Tip>
+
+Here is the canonical implementation of this pattern, taken directly from
+`commit_cancel.function.ts`:
+
+```typescript
+// After confirming the order book is clean, place the limit sell
+const order = await binance.order(
+  "LIMIT",
+  "SELL",
+  symbol,
+  Number(quantity$),
+  Number(averagePrice$)
+);
+
+const { orderId, status } = order;
+
+if (status === "FILLED") {
+  return getAveragePrice(order, Number(averagePrice$));
+} else {
+  let isNotClosed = true;
+  let lastStatus: Order = null;
+  for (let i = 0; i !== 10; i++) {
+    await sleep(10_000);
+    lastStatus = await binance.orderStatus(symbol, orderId);
+    if (lastStatus.status === "FILLED") {
+      isNotClosed = false;
+      break;
+    }
+  }
+  if (isNotClosed) {
+    await binance.cancel(symbol, orderId);
+    const orderQty = await formatQuantity(
+      symbol,
+      Number(quantity) - Number(lastStatus?.executedQty || 0),
+      binance
+    );
+    lastStatus = await binance.marketSell(symbol, Number(orderQty));
+    return getAveragePrice(lastStatus, Number(averagePrice$));
+  } else {
+    return getAveragePrice(lastStatus, Number(averagePrice$));
+  }
+}
+```
+
+---
+
+## How `commitCancel` Implements All Three Steps
+
+`COMMIT_CANCEL_FN` in `src/function/commit_cancel.function.ts` is the
+reference implementation. It encodes all three steps end-to-end:
+
+```typescript
+export const COMMIT_CANCEL_FN = async (
+  { symbol, averagePrice }: IParams,
+  binance: Binance
+) => {
+  const coinName = getCoinName(symbol);
+
+  // ── Step 1: Cancel all open orders (up to 10 rounds) ────────────────────
+  {
+    let error;
+    for (let i = 0; i !== 10; i++) {
+      let isOk = true;
+      const orders = await binance.openOrders(symbol);
+      for (const order of orders) {
+        try {
+          await sleep(1_000);
+          await binance.cancel(symbol, order.orderId);
+          error = null;
+        } catch (e) {
+          isOk = false;
+          error = e;
+          continue;           // tolerate individual cancel failures
+        }
+      }
+      if (!orders.length) {
+        error = null;
+        break;                // nothing left to cancel
+      }
+      if (isOk) {
+        break;                // full sweep with no errors
+      }
+    }
+    if (error) {
+      throw error;
+    }
+  }
+
+  // ── Step 2: Verify book is empty ─────────────────────────────────────────
+  {
+    let error;
+    for (let i = 0; i !== 10; i++) {
+      try {
+        await sleep(1_000);
+        const { length: hasOrders } = await binance.openOrders(symbol);
+        if (hasOrders) {
+          error = new Error("Order not canceled");
+        } else {
+          error = null;
+          break;              // confirmed clean
+        }
+      } catch (e) {
+        error = e;
+      }
+    }
+    if (error) {
+      throw error;
+    }
+  }
+
+  // ── Step 3: Sell the free balance (with market fallback) ─────────────────
+  const balanceMap = await FETCH_BALANCE_FN(binance);
+  const balance = balanceMap[coinName];
+  // ... dust guard, formatQuantity, limit order + poll loop (see above)
+};
+```
+
+---
+
+## Why `commitBuy` Returns `0` When Orders Exist
+
+`COMMIT_BUY_FN` checks for open orders _before_ placing a buy:
+
+```typescript
+export const COMMIT_BUY_FN = async (
+  { amountUSDT, averagePrice, symbol }: IParams,
+  binance: Binance
+) => {
+  const { length: hasOrders } = await binance.openOrders(symbol);
+  if (hasOrders) {
+    return 0;   // guard: do not double-enter
+  }
+
+  const balance = await getBalance(binance);
+  if (balance < amountUSDT) {
+    return 0;   // guard: insufficient free USDT
+  }
+  // ...
+};
+```
+
+Returning `0` (instead of throwing) is a **double-entry guard**. If a
+previous buy's TP/SL OCO orders are still live, this call is a no-op.
+The caller can treat a `0` return as "position already open, no action
+taken" without needing exception-handling logic.
+
+<Note>
+  `WalletPublicService.commitBuy` does not pass the `averagePrice` from the
+  caller — it fetches it internally via `fetchPrice`. This ensures the limit
+  price is always based on the current market, not a stale value.
+</Note>
+
+---
+
+## The `minQty` Dust Guard
+
+Before placing any sell, `commitCancel` computes the sell quantity net of
+fees and the exchange's minimum lot size:
+
+```typescript
+const { maker } = await getTransactionFee(symbol, binance);
+
+const quantity =
+  balance.quantity - percentValue(balance.quantity, maker) - minQty;
+
+if (quantity <= minQty) {
+  return 0;   // dust — balance too small to sell, skip
+}
+```
+
+If the remaining balance is less than or equal to `minQty` after subtracting
+the maker commission, the function returns `0` immediately without placing
+any order. This prevents rejected orders due to lot-size violations when only
+a tiny residual ("dust") amount remains after a partial fill or a previous
+partial exit.
+
+<Tip>
+  A `0` return from `commitCancel` is not an error — it means the position
+  was already flat or the remaining balance was below the exchange minimum.
+  The broker adapter can safely treat it as a confirmed close.
+</Tip>

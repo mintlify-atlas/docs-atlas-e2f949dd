@@ -1,0 +1,72 @@
+---
+title: "fetchPrice: Get Current Binance Average Price"
+sidebarTitle: "fetchPrice"
+description: "fetchPrice returns the Binance average price for a symbol, formatted to the exchange tick size. Price data is sourced from the avgPrice endpoint."
+---
+
+`fetchPrice` returns the current 5-minute weighted average price for a Binance spot symbol, rounded to the symbol's exchange-defined `tickSize`. It is used internally by all `commit*` methods in `WalletPublicService` to obtain the reference price before placing or pricing orders. When called directly, it gives a fast, tick-aligned snapshot of the current market price.
+
+## Signature
+
+```typescript
+fetchPrice(symbol: string): Promise<number>
+```
+
+## Parameters
+
+<ParamField path="symbol" type="string" required>
+  Binance trading pair symbol, e.g. `"SOLUSDT"`. Must be a valid spot symbol recognized by Binance.
+</ParamField>
+
+## Return value
+
+`Promise<number>` — the current 5-minute average price, formatted (truncated) to the symbol's `PRICE_FILTER` `tickSize` and returned as a JavaScript `number`.
+
+## Data source and formatting
+
+The price is obtained from `binance.avgPrice(symbol)`, which returns Binance's 5-minute weighted average price. The raw float is then passed through `formatPrice()`:
+
+```typescript
+const { tickSize } = await getExchangeInfo(symbol, "PRICE_FILTER", binance);
+return roundTicks(averagePrice, tickSize);
+```
+
+`roundTicks` truncates the value to the number of decimal places implied by `tickSize` (e.g. `tickSize = "0.01"` → 2 decimal places), ensuring the price is always valid for order placement on that symbol.
+
+## Caching notes
+
+`FETCH_PRICE_FN` itself does not cache — each call hits `binance.avgPrice()` directly. However, `WalletPrivateService` uses a shared `getTickerInfo` helper (30-second TTL via `ttl` from `functools-kit`) for bulk price lookups. The `fetchOrders` and `fetchPnl` caches are separate (10-minute TTL) and are not affected by price calls.
+
+Because `WalletPublicService` fetches the price **before** enqueuing a commit operation, the price snapshot is taken at the moment the caller invokes the method, not at the moment the queued runner begins execution.
+
+## Internal usage
+
+Every `commit*` method in `WalletPublicService` calls `walletPrivateService.fetchPrice(symbol)` as its first step:
+
+- `commitBuy` — uses the returned price to compute the limit order price (`× 1.001`) and the USDT-to-coin quantity conversion.
+- `commitSell` — uses it to compute `× 0.999` and `usdToCoins`.
+- `commitTrade` — validates `takeProfitPrice > fetchPrice > stopLossPrice` before enqueuing.
+- `commitCancel` — uses it to price the exit limit sell at `× 0.999`.
+
+## Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// REPL usage:
+// repl => await wallet.walletPublicService.fetchPrice("SOLUSDT")
+// 77.56
+
+const price = await walletPublicService.fetchPrice("SOLUSDT");
+console.log(`Current SOLUSDT average price: ${price}`);
+
+// Fetch prices for several symbols concurrently
+const [solPrice, btcPrice, ethPrice] = await Promise.all([
+  walletPublicService.fetchPrice("SOLUSDT"),
+  walletPublicService.fetchPrice("BTCUSDT"),
+  walletPublicService.fetchPrice("ETHUSDT"),
+]);
+console.log({ solPrice, btcPrice, ethPrice });
+```

@@ -1,47 +1,234 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Wallet Manager in 3 Steps"
+sidebarTitle: "Quickstart"
+description: "Learn how to configure Binance API keys, build the ESM bundle, and run your first REPL commands with Wallet Manager in under 5 minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
+This guide walks you from a fresh checkout to a live REPL session where you can inspect prices, balances, and orders against your Binance spot account.
 
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+<Warning>
+  **Live keys, real money.** Once you supply real API credentials and call any
+  `commit*` method, Wallet Manager places actual orders on Binance spot. There
+  is no dry-run mode. Complete the read-only commands in Step 5 before
+  attempting any mutating calls.
+</Warning>
 
 ## Prerequisites
 
-Before you begin, you must have:
+- **Node.js** 18 or later (ESM + top-level `await` support required)
+- A **Binance spot account** with funds you are comfortable testing with
+- A Binance **API key** and **secret** with _Spot Trading_ permission enabled
+  - Withdraw permission is **not** needed and should be left disabled
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
-
-## Get started
+---
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
 
-    ```bash
-    npm install your-package
-    ```
-  </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+<Step title="Clone and install">
 
-    ```bash
-    your-cli init
-    ```
-  </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+```bash
+git clone https://github.com/tripolskypetr/wallet-manager.git
+cd wallet-manager
+npm install
+```
 
-    ```bash
-    your-cli start
-    ```
-  </Step>
+<Note>
+  The package is private (`"private": true` in `package.json`) and not
+  published to npm, so it must be cloned directly. All runtime dependencies —
+  `node-binance-api`, `di-kit`, `di-scoped`, `functools-kit`, and friends —
+  are installed by `npm install`.
+</Note>
+
+</Step>
+
+<Step title="Configure your API keys">
+
+Create a `.env` file in the project root. Wallet Manager reads exactly two variables (from `src/config/params.ts`):
+
+<CodeGroup>
+
+```bash .env
+CC_BINANCE_API_KEY=your_api_key_here
+CC_BINANCE_API_SECRET=your_api_secret_here
+```
+
+```typescript src/config/params.ts (reference)
+export const CC_BINANCE_API_KEY = process.env.CC_BINANCE_API_KEY || "";
+export const CC_BINANCE_API_SECRET = process.env.CC_BINANCE_API_SECRET || "";
+```
+
+</CodeGroup>
+
+The `.env` file is loaded automatically by `dotenv` when you run `npm start` — you never need to `source` it or set the variables in your shell environment.
+
+</Step>
+
+<Step title="Build and start the REPL">
+
+```bash
+npm start
+```
+
+The `start` script runs two things in sequence (from `package.json`):
+
+```json package.json
+{
+  "scripts": {
+    "start": "npm run build && dotenv -e .env -- node ./scripts/repl.mjs",
+    "build": "rollup -c"
+  }
+}
+```
+
+1. **`npm run build`** — Rollup compiles `src/index.ts` to `build/index.mjs` (ESM bundle).
+2. **`dotenv -e .env -- node ./scripts/repl.mjs`** — loads `.env` into the process environment, then starts the REPL.
+
+When the build succeeds you will see the `repl =>` prompt:
+
+```
+repl =>
+```
+
+The REPL evaluates raw JavaScript. `await` is supported at the top level. Objects are pretty-printed as JSON. Type `exit` to quit.
+
+</Step>
+
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+---
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+## First commands in the REPL
+
+All read-only commands go through `wallet.walletPublicService`. Start here — nothing below modifies your account.
+
+### Fetch current price
+
+```
+repl => await wallet.walletPublicService.fetchPrice("SOLUSDT")
+77.56
+```
+
+Returns the current price as a `number`. Results are cached for 30 seconds per symbol.
+
+### Fetch USDT balance
+
+```
+repl => await wallet.walletPublicService.fetchFiat("SOLUSDT")
+142.30
+```
+
+Returns your total USDT balance (free + locked in open orders) as a `number`.
+
+### Fetch coin balance
+
+```
+repl => await wallet.walletPublicService.fetchBalance("SOLUSDT")
+{
+  "quantity": 1.85,
+  "usdt": 143.49
+}
+```
+
+Returns a `{ quantity, usdt }` object for the coin associated with the symbol. `quantity` includes any amounts currently locked in open orders (`onOrder`).
+
+### Fetch recent orders
+
+```
+repl => await wallet.walletPublicService.fetchOrders("SOLUSDT", 25)
+```
+
+Returns up to 25 recent orders (`FILLED`, `CANCELED`, or `NEW`) with side, price, quantities, and timestamps.
+
+### Fetch daily PnL
+
+```
+repl => await wallet.walletPublicService.fetchPnl("SOLUSDT", 25)
+```
+
+Returns a daily PnL estimate reconstructed from trade history and 1-hour candles.
+
+### Dump results to a file
+
+The `fs` global (Node's built-in `fs` module) is injected by `scripts/repl.mjs` so you can save any result without leaving the REPL:
+
+```
+repl => const result = await wallet.walletPublicService.fetchOrders("SOLUSDT", 50)
+repl => fs.writeFileSync("orders.json", JSON.stringify(result, null, 2))
+```
+
+---
+
+## REPL globals
+
+Two globals are available in every REPL session:
+
+| Global | Description |
+|---|---|
+| `wallet` | The service container — holds `walletPublicService` and `walletPrivateService`. |
+| `fs` | Node's built-in `fs` module — useful for writing results to disk. |
+
+`wallet` is also assigned to `globalThis` by `src/index.ts`, so it is accessible from any imported module loaded into the same process.
+
+---
+
+## Using Wallet Manager as a library
+
+After building (`npm run build`), import from `build/index.mjs` in your own scripts:
+
+<CodeGroup>
+
+```typescript ESM import
+import { wallet } from "./build/index.mjs";
+
+// wallet.walletPublicService — queued, validated, audited
+const price = await wallet.walletPublicService.fetchPrice("SOLUSDT");
+const balance = await wallet.walletPublicService.fetchBalance("SOLUSDT");
+// balance: { quantity: number; usdt: number }
+
+// wallet.walletPrivateService — raw layer, no queueing or validation
+// Use only for debugging or custom flows.
+```
+
+```typescript Type signature (types.d.ts)
+declare const wallet: {
+  walletPublicService: WalletPublicService;
+  walletPrivateService: WalletPrivateService;
+};
+
+declare class WalletPublicService {
+  fetchPrice(symbol: string): Promise<number>;
+  fetchFiat(symbol: string): Promise<number>;
+  fetchBalance(symbol: string): Promise<{ usdt: number; quantity: number }>;
+  fetchOrders(symbol: string, limit?: number): Promise<IOrderData[]>;
+  fetchPnl(symbol: string, limit?: number): Promise<IDailyPnL[]>;
+
+  commitBuy(symbol: string, amountUSDT: number): Promise<number>;
+  commitSell(symbol: string, amountUSDT: number): Promise<number>;
+  commitTrade(
+    symbol: string,
+    amountUSDT: number,
+    takeProfitPrice: number,
+    stopLossPrice: number
+  ): Promise<0 | { status: string; content: string }>;
+  commitCancel(symbol: string): Promise<number>;
+  commitReload(symbol: string): Promise<void>;
+}
+```
+
+</CodeGroup>
+
+<Note>
+  Always prefer `wallet.walletPublicService` over `wallet.walletPrivateService`
+  in application code. The public service serializes calls per symbol (no
+  concurrent orders on the same symbol), validates arguments, and writes an
+  audit record to the console after every commit:
+  `{ symbol, action, amountUSDT, averagePrice, date, status }`.
+</Note>
+
+---
+
+## Next steps
+
+- **[REPL Guide](/repl/overview)** — Full reference for every mutating command: `commitBuy`, `commitSell`, `commitTrade`, and `commitCancel`.
+- **[Broker Adapter](/broker/overview)** — See how the commit flows map to a production backtest-kit broker adapter, including idempotent reconcile by `clientOrderId` and terminal rejection on the fifth attempt.
+- **[API Reference](/api/wallet-public-service)** — Complete TypeScript signatures for both services and all data types.

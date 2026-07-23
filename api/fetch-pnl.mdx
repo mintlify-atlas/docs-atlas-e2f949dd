@@ -1,0 +1,111 @@
+---
+title: "fetchPnl: Daily PnL Reconstructed from Trade History"
+sidebarTitle: "fetchPnl"
+description: "fetchPnl reconstructs daily profit and loss from trade history using partial fill matching and VWAP from 1-hour candles, grouped by calendar day."
+---
+
+`fetchPnl` reconstructs an estimated daily profit-and-loss breakdown from the order history returned by `fetchOrders`. It uses a partial-fill matching algorithm to pair BUY and SELL orders (including cross-day trades), calculates the realized PnL for each day, and derives a USDT position value using the VWAP of 1-hour Binance candles for that day. Results are cached for 10 minutes and are invalidated automatically after any `commit*` operation.
+
+## Signature
+
+```typescript
+fetchPnl(symbol: string, limit?: number): Promise<IDailyPnL[]>
+```
+
+## Parameters
+
+<ParamField path="symbol" type="string" required>
+  Binance trading pair symbol, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="limit" type="number">
+  Number of orders to pull from trade history (passed to `fetchOrders`). Defaults to `25`. A higher limit provides more history but increases computation time and API usage.
+</ParamField>
+
+## Return value
+
+`Promise<IDailyPnL[]>` — an array of daily PnL records, sorted newest-first (descending by date). Only days that have at least one matched BUY-SELL pair appear in the result.
+
+<ResponseField name="IDailyPnL" type="object">
+  Daily PnL record for a single calendar day.
+
+  <Expandable title="IDailyPnL fields">
+    <ResponseField name="date" type="string">
+      Calendar day in ISO 8601 format, e.g. `"2025-01-15T00:00:00.000Z"`. Derived from the SELL order's date (the day the trade was closed).
+    </ResponseField>
+    <ResponseField name="pnl" type="string">
+      Realized PnL for matched trades closed on this day, formatted to the symbol's `PRICE_FILTER` `tickSize`. Positive means profit; negative means loss. Computed as `(sellPrice - buyPrice) × matchedQuantity` summed over all pairs.
+    </ResponseField>
+    <ResponseField name="walletCost" type="string">
+      Average cost basis of the matched BUY orders contributing to this day's PnL. Formatted to tick size. Computed as `totalBuyCost / totalMatchedQty`.
+    </ResponseField>
+    <ResponseField name="amountQty" type="string">
+      Cumulative coin balance at the end of this day, computed from all orders in chronological order (BUYs add, SELLs subtract). Formatted to `LOT_SIZE` `stepSize`.
+    </ResponseField>
+    <ResponseField name="amountUSDT" type="string">
+      USDT value of `amountQty` at the day's VWAP price. Formatted to tick size.
+    </ResponseField>
+    <ResponseField name="averagePrice" type="string">
+      VWAP (Volume-Weighted Average Price) for the day, computed from 1-hour Binance candles spanning the full calendar day. Formatted to tick size.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## Algorithm
+
+The PnL reconstruction runs in two passes:
+
+**Pass 1 — Group orders by day.** Only `FILLED` orders are considered. Each order is assigned a `dayStamp` (a date integer from `getMomentStamp`). Orders are grouped into `{ buys, sells }` buckets per day.
+
+**Pass 2 — Partial-fill matching with cross-day support.** For each day that has BUY orders, all SELLs from that day **and all future days** are included as potential match candidates. This supports the common pattern of buying on day N and selling on day N+1 or later. The matching algorithm:
+
+```typescript
+// For each BUY, iterate matching SELLs in chronological order:
+const tradeQty = Math.min(remainingBuyQty, sellRemainingQty);
+const pnl = (sell.price - buy.price) * tradeQty;
+// PnL is attributed to the SELL's calendar day
+```
+
+Partial fills are tracked per `orderId` so a single large SELL can be matched against multiple smaller BUYs.
+
+**VWAP for daily price.** For each day in the result, `getAvgPriceForDay` fetches hourly candles via `binance.candles(symbol, "1h", { startTime, endTime })` and computes:
+
+```typescript
+vwap = Σ(closePrice × volume) / Σ(volume)
+```
+
+## Caching
+
+`WalletPrivateService.fetchPnl` is wrapped with `ttl` from `functools-kit`:
+
+- **TTL**: 10 minutes (`600_000` ms) per `(symbol, limit)` cache key.
+- **Invalidated** automatically after any `commit*` call (via `walletPrivateService.clear()`).
+- A GC sweep runs every 30 seconds to evict expired entries.
+
+## Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// REPL usage:
+// repl => await wallet.walletPublicService.fetchPnl("SOLUSDT", 25)
+
+const pnlHistory = await walletPublicService.fetchPnl("SOLUSDT", 25);
+
+pnlHistory.forEach((day) => {
+  console.log(
+    `${day.date.slice(0, 10)}  PnL: ${day.pnl}  ` +
+    `Balance: ${day.amountQty} SOL (${day.amountUSDT} USDT)  ` +
+    `VWAP: ${day.averagePrice}  Cost basis: ${day.walletCost}`
+  );
+});
+
+// Dump to file from REPL:
+// repl => fs.writeFileSync("pnl.json", JSON.stringify(pnlHistory, null, 2))
+```
+
+<Warning>
+  `fetchPnl` produces an **estimate**, not a realized-PnL ledger. The algorithm reconstructs trades from order history using simple price-times-quantity math and does not account for trading fees, funding costs, or the exact execution prices of partial fills from the exchange. The VWAP-based `amountUSDT` field reflects an unrealized valuation at the day's average price, not a cash balance. Use it for directional insight, not accounting.
+</Warning>

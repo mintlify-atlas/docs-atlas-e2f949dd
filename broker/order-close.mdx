@@ -1,0 +1,295 @@
+---
+title: "Implementing onOrderCloseCommit: Flatten and Exit to Cash"
+sidebarTitle: "Order Close"
+description: "The onOrderCloseCommit hook cancels all open orders on the symbol, verifies zero resting orders, then sells the entire free coin balance to USDT with a market fallback."
+---
+
+## Overview
+
+`onOrderCloseCommit` is called by the engine when it wants to exit a position. The correct spot sequence is always:
+
+1. **Cancel all open orders** — resting TP, SL, stale limit entries, and any artifacts from previous attempts all lock coin or USDT. Trying to sell while orders are live causes insufficient-balance errors or silently trades only the unlocked remainder.
+2. **Verify the book is clean** — confirm zero open orders before touching the balance.
+3. **Sell the entire free coin balance** — not just the engine's own position size, so any orphan tranches acquired outside the engine are swept by the same exit.
+
+This is the same flow as `commitCancel` in `src/function/commit_cancel.function.ts`.
+
+<Note>
+Any throw from `onOrderCloseCommit` is **transient**: the engine keeps the position open and retries the close on the next tick with `attempt + 1`. On exhausting `CC_ORDER_CLOSE_RETRY_ATTEMPTS`, the engine force-closes its internal state. The three-step sequence is designed to be safely retried from the top.
+</Note>
+
+## Implementation walkthrough
+
+<Steps>
+
+### Step 1 — Backtest guard
+
+```typescript
+if (payload.backtest) return; // never touch the exchange in backtest mode
+```
+
+Identical to the open hook: return immediately in backtest mode. The engine records the close as confirmed at `payload.currentPrice` without any exchange call.
+
+### Step 2 — Cancel sweep (up to `CANCEL_ROUNDS` iterations)
+
+```typescript
+const { symbol, currentPrice } = payload;
+const coinName = getCoinName(symbol); // e.g. "SOL" from "SOLUSDT"
+
+{
+  let error;
+  for (let i = 0; i !== CANCEL_ROUNDS; i++) {   // CANCEL_ROUNDS = 10
+    let isOk = true;
+    const orders = await binance.openOrders(symbol);
+
+    for (const order of orders) {
+      try {
+        await sleep(1_000);                       // 1 s between each cancel
+        await binance.cancel(symbol, order.orderId);
+        error = null;
+      } catch (e) {
+        isOk = false;
+        error = e;
+        continue;                                 // tolerate individual failures
+      }
+    }
+
+    if (!orders.length) {
+      error = null;
+      break;                                      // nothing left — done
+    }
+    if (isOk) {
+      break;                                      // all cancelled cleanly — done
+    }
+  }
+
+  if (error) {
+    throw error;                                  // transient — engine retries
+  }
+}
+```
+
+The outer loop runs up to 10 times. On each iteration it fetches the current open orders and attempts to cancel each one with a 1-second sleep between cancels. Individual cancel failures are **tolerated** — the loop continues past them. If all orders are successfully cancelled (or the list was already empty) the sweep exits cleanly. Only if an error persists after all rounds does the function throw — which triggers a transient engine retry.
+
+<Note>
+Tolerating individual cancel failures is intentional. A cancel can fail if the order filled in the narrow window between `openOrders` and `cancel`. The next sweep iteration will re-fetch the list and handle whatever remains.
+</Note>
+
+### Step 3 — Verify clean book
+
+```typescript
+{
+  let error;
+  for (let i = 0; i !== CANCEL_ROUNDS; i++) {   // up to 10 verification polls
+    try {
+      await sleep(1_000);
+      const { length: hasOrders } = await binance.openOrders(symbol);
+      if (hasOrders) {
+        error = new Error("Order not canceled");
+      } else {
+        error = null;
+        break;                                    // zero open orders — proceed
+      }
+    } catch (e) {
+      error = e;
+    }
+  }
+
+  if (error) {
+    throw error;
+  }
+}
+```
+
+Even after the cancel sweep, network races can leave a count mismatch. This second loop polls `openOrders` up to 10 more times until the list is empty. Only once `length === 0` is confirmed does the adapter proceed to sell.
+
+<Note>
+This two-phase approach (cancel sweep → verify) is the key to avoiding the classic spot mistake: placing a sell on top of a locked balance. The verify step guarantees the book is clean before any sell order is submitted.
+</Note>
+
+### Step 4 — Fetch free coin balance
+
+```typescript
+const account    = await binance.account();
+const coinBalance = account.balances.find(({ asset }) => asset === coinName);
+
+if (!coinBalance) {
+  throw new Error(`Can't fetch balance (close) for ${coinName}`);
+}
+
+const freeQty = parseFloat(coinBalance.free);
+```
+
+After all orders are cancelled, `free` reflects the actual spendable quantity — coins that were locked in resting orders are now unlocked.
+
+### Step 5 — Dust guard (`minQty`)
+
+```typescript
+const { minQty } = await getExchangeInfo(symbol, "LOT_SIZE", binance);
+if (!minQty) {
+  throw new Error(`Can't fetch minimal quantity (close) for ${coinName}`);
+}
+
+const maker    = account.makerCommission / 100;
+const quantity = freeQty - percentValue(freeQty, maker) - Number(minQty);
+
+if (quantity <= Number(minQty)) {
+  return; // dust — nothing to sell, confirm the close
+}
+```
+
+The sellable quantity is the free balance minus the maker commission reserve minus the exchange's `minQty` floor. If the result is at or below `minQty`, there is nothing worth selling — the function returns, confirming the close without placing an order.
+
+<Note>
+`percentValue(freeQty, maker)` deducts the maker fee so the calculated sell quantity does not cause an "insufficient balance" error when the exchange applies the commission on execution.
+</Note>
+
+### Step 6 — Format sell quantity and exit price
+
+```typescript
+const sellQty   = await formatQuantity(symbol, quantity, binance);
+const sellPrice = await formatPrice(
+  symbol,
+  currentPrice * TRADE_SELL_LOWER_PERCENT,   // 0.999 × market price
+  binance
+);
+```
+
+The sell limit price is set 0.1 % below the current market price (`TRADE_SELL_LOWER_PERCENT = 0.999`). This small discount increases the probability of immediate fill while still capturing a limit price rather than accepting full market slippage.
+
+### Step 7 — Place limit SELL and poll for fill
+
+```typescript
+const order = await binance.order(
+  "LIMIT", "SELL", symbol, Number(sellQty), Number(sellPrice)
+);
+
+if (order.status === "FILLED") {
+  return; // instant fill — position closed
+}
+
+let last = order;
+for (let i = 0; i !== FILL_POLL_ATTEMPTS; i++) {  // 10 × 10 s
+  await sleep(FILL_POLL_INTERVAL_MS);
+  last = await binance.orderStatus(symbol, order.orderId);
+  if (last.status === "FILLED") {
+    return; // fill arrived — position closed
+  }
+}
+```
+
+The same poll loop as `onOrderOpenCommit`: 10 checks, 10 seconds apart, up to ~100 seconds total.
+
+### Step 8 — Timeout fallback: cancel and market-sell remainder
+
+```typescript
+await binance.cancel(symbol, order.orderId);
+
+const restQty = await formatQuantity(
+  symbol,
+  Number(sellQty) - Number(last?.executedQty ?? 0),
+  binance
+);
+await binance.marketSell(symbol, Number(restQty));
+```
+
+If the limit SELL does not fill within the poll window, it is cancelled and the **remaining** unfilled quantity (`sellQty − executedQty`) is submitted as a market sell. This guarantees the position is always cashed out — the close never stays pending.
+
+</Steps>
+
+## Why this sweeps orphan tranches
+
+The exit sells the **entire free coin balance**, not the engine's `payload.quantityClose` field. This is a deliberate design choice:
+
+- If any coin was purchased outside the engine (a manual buy, a previous partial fill that was never rolled back, an OCO fill), it will be in the free balance after orders are cancelled.
+- Selling the entire free balance ensures the symbol is fully flat regardless of how the coin was acquired.
+- The engine does not care about the difference — from its perspective, the position is closed when `onOrderCloseCommit` returns without throwing.
+
+## Complete `onOrderCloseCommit` code
+
+```typescript
+override async onOrderCloseCommit(payload: BrokerOrderClosePayload) {
+  if (payload.backtest) return;
+  const { symbol, currentPrice } = payload;
+  const binance  = await getBinance();
+  const coinName = getCoinName(symbol);
+
+  // Step 1: cancel sweep
+  {
+    let error;
+    for (let i = 0; i !== CANCEL_ROUNDS; i++) {
+      let isOk = true;
+      const orders = await binance.openOrders(symbol);
+      for (const order of orders) {
+        try {
+          await sleep(1_000);
+          await binance.cancel(symbol, order.orderId);
+          error = null;
+        } catch (e) {
+          isOk = false;
+          error = e;
+          continue;
+        }
+      }
+      if (!orders.length) { error = null; break; }
+      if (isOk)           { break; }
+    }
+    if (error) throw error;
+  }
+
+  // Step 2: verify clean book
+  {
+    let error;
+    for (let i = 0; i !== CANCEL_ROUNDS; i++) {
+      try {
+        await sleep(1_000);
+        const { length: hasOrders } = await binance.openOrders(symbol);
+        if (hasOrders) {
+          error = new Error("Order not canceled");
+        } else {
+          error = null;
+          break;
+        }
+      } catch (e) {
+        error = e;
+      }
+    }
+    if (error) throw error;
+  }
+
+  // Step 3: exit to cash
+  const account     = await binance.account();
+  const coinBalance = account.balances.find(({ asset }) => asset === coinName);
+  if (!coinBalance) throw new Error(`Can't fetch balance (close) for ${coinName}`);
+  const freeQty = parseFloat(coinBalance.free);
+
+  const { minQty } = await getExchangeInfo(symbol, "LOT_SIZE", binance);
+  if (!minQty) throw new Error(`Can't fetch minimal quantity (close) for ${coinName}`);
+
+  const maker    = account.makerCommission / 100;
+  const quantity = freeQty - percentValue(freeQty, maker) - Number(minQty);
+  if (quantity <= Number(minQty)) return; // dust
+
+  const sellQty   = await formatQuantity(symbol, quantity, binance);
+  const sellPrice = await formatPrice(symbol, currentPrice * TRADE_SELL_LOWER_PERCENT, binance);
+
+  const order = await binance.order("LIMIT", "SELL", symbol, Number(sellQty), Number(sellPrice));
+  if (order.status === "FILLED") return;
+
+  let last = order;
+  for (let i = 0; i !== FILL_POLL_ATTEMPTS; i++) {
+    await sleep(FILL_POLL_INTERVAL_MS);
+    last = await binance.orderStatus(symbol, order.orderId);
+    if (last.status === "FILLED") return;
+  }
+
+  // Timeout: cancel and market-sell remainder
+  await binance.cancel(symbol, order.orderId);
+  const restQty = await formatQuantity(
+    symbol,
+    Number(sellQty) - Number(last?.executedQty ?? 0),
+    binance
+  );
+  await binance.marketSell(symbol, Number(restQty));
+}
+```

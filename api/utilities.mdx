@@ -1,0 +1,264 @@
+---
+title: "Utility Functions: Formatting and Conversion Helpers"
+sidebarTitle: "Utilities"
+description: "Wallet Manager exposes four utility functions for price formatting, quantity calculation, coin name extraction, and percentage computation used throughout the order flow."
+---
+
+## Overview
+
+These four pure helper functions underpin every order placement and balance calculation in the `commit_*` and `fetch_*` pipeline. They carry no Binance dependency and can be imported and used in isolation.
+
+---
+
+## roundTicks
+
+```typescript
+roundTicks(price: string | number, tickSize: number): string
+```
+
+Rounds a price or quantity value to the decimal precision defined by the exchange's `tickSize` (for price) or `stepSize` (for quantity). Returns a formatted string ready to pass directly to `binance.order()`.
+
+**Source:**
+
+```typescript
+export const roundTicks = (price: string | number, tickSize: number) => {
+    const formatter = new Intl.NumberFormat('en-US', {
+        style: 'decimal',
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 8
+    });
+    // @ts-ignore
+    const precision = formatter.format(tickSize).split('.')[1].length || 0;
+    if (typeof price === 'string') price = parseFloat(price);
+    return price.toFixed(precision);
+};
+```
+
+**How it works:**
+
+Uses `Intl.NumberFormat` to format `tickSize` to a locale-neutral decimal string, then counts the characters after the decimal point to determine the required precision. Applies that precision to the input `price` via `Number.prototype.toFixed`.
+
+<Note>
+  Binance rejects any order where the price or quantity does not match the
+  symbol's declared `tickSize` / `stepSize` precision exactly. `roundTicks` is
+  called internally by every `commit_*` function before posting an order — for
+  both the price (via `PRICE_FILTER tickSize`) and the quantity (via `LOT_SIZE
+  stepSize`). Passing a raw float directly to `binance.order()` will typically
+  result in a `-1111 Parameter 'quantity' has too much precision` error.
+</Note>
+
+<ParamField path="price" type="string | number" required>
+  The price or quantity value to round. Strings are parsed to float before rounding.
+</ParamField>
+
+<ParamField path="tickSize" type="number" required>
+  The exchange filter precision value, e.g. `0.01` for 2 decimal places, `0.00001` for 5. Obtained from `exchangeInfo` `PRICE_FILTER.tickSize` or `LOT_SIZE.stepSize`.
+</ParamField>
+
+**Returns:** `string` — the value formatted to the correct decimal precision.
+
+**Example:**
+
+```typescript
+import { roundTicks } from "./src/utils/roundTicks";
+
+roundTicks(77.56123, 0.01);     // → "77.56"   (PRICE_FILTER tickSize = 0.01)
+roundTicks(0.253891, 0.001);    // → "0.254"   (LOT_SIZE stepSize = 0.001)
+roundTicks("0.00089912", 0.00001); // → "0.00090" (stepSize = 0.00001)
+roundTicks(77.56, 1);           // → "77"      (integer precision)
+```
+
+**Where it is used in the order flow:**
+
+```typescript
+// Inside commit_buy.function.ts — formatting before binance.order()
+const orderPrice = await formatPrice(symbol, averagePrice * 1.001, binance);
+// formatPrice internally calls:
+//   roundTicks(price, tickSize)  ← tickSize from PRICE_FILTER
+
+const quantity = await formatQuantity(symbol, usdToCoins(amountUSDT, averagePrice), binance);
+// formatQuantity internally calls:
+//   roundTicks(quantity, stepSize)  ← stepSize from LOT_SIZE
+```
+
+---
+
+## percentValue
+
+```typescript
+percentValue(value: number, percent: number): number
+```
+
+Returns `(value × percent) / 100`. A simple percentage calculation used to deduct trading fees from coin balances before placing sell orders.
+
+**Source:**
+
+```typescript
+/**
+ * Calculates the percentage value of a given number.
+ *
+ * @param {number} value - The base value to calculate the percentage from.
+ * @param {number} percent - The percentage to apply to the base value.
+ * @returns {number} The calculated percentage value.
+ */
+export const percentValue = (value: number, percent: number): number => {
+    return (value * percent) / 100;
+};
+```
+
+<Note>
+  In `COMMIT_CANCEL_FN` and `COMMIT_TRADE_FN`, this function is called with the
+  Binance account's `makerCommission` (e.g. `10` for 0.10%) to subtract the
+  maker fee from the coin balance before placing the exit sell — preventing
+  "insufficient balance" errors caused by the fee being deducted on execution.
+  The pattern is always: `quantity − percentValue(quantity, makerCommission) − minQty`.
+</Note>
+
+<ParamField path="value" type="number" required>
+  The base number to compute the percentage of.
+</ParamField>
+
+<ParamField path="percent" type="number" required>
+  The percentage to apply. Pass `0.1` for 0.1%, `10` for 10%, etc. Note that `makerCommission` from `binance.account()` is already expressed as basis points divided by 100 (e.g. `10` = 0.10%), so it is passed directly: `makerCommission / 100` gives the decimal rate, but internally `percentValue` handles the `/100` division itself.
+</ParamField>
+
+**Returns:** `number` — the computed percentage amount (not the reduced value — just the portion to subtract).
+
+**Example:**
+
+```typescript
+import { percentValue } from "./src/utils/percentValue";
+
+percentValue(100, 0.1);   // → 0.1   (0.1% of 100)
+percentValue(0.253, 10);  // → 0.0253 (10% of 0.253, for fee deduction)
+percentValue(500, 1);     // → 5     (1% of 500)
+```
+
+**Usage in `COMMIT_CANCEL_FN`:**
+
+```typescript
+// From commit_cancel.function.ts
+const { maker } = await getTransactionFee(symbol, binance);
+// maker = makerCommission / 100 (e.g. 10 basis points → maker = 0.10)
+
+const quantity =
+  balance.quantity - percentValue(balance.quantity, maker) - minQty;
+//                   ↑ deducts maker fee fraction from coin quantity
+```
+
+---
+
+## usdToCoins
+
+```typescript
+usdToCoins(quantity: number, price: number): number
+```
+
+Converts a USDT amount to a coin quantity at a given price. Returns `quantity / price`.
+
+**Source:**
+
+```typescript
+export const usdToCoins = (quantity: number, price: number) => {
+    return quantity / price;
+};
+```
+
+<Note>
+  The raw result from `usdToCoins` is always passed through `roundTicks` (via
+  `formatQuantity`) before being used in an order. The raw float has more
+  decimal places than Binance accepts for the symbol's `LOT_SIZE stepSize`.
+</Note>
+
+<ParamField path="quantity" type="number" required>
+  The USDT amount to convert (the "cost" of the trade).
+</ParamField>
+
+<ParamField path="price" type="number" required>
+  The current price of the coin in USDT. Typically `averagePrice` from the caller.
+</ParamField>
+
+**Returns:** `number` — the coin quantity corresponding to spending `quantity` USDT at `price`.
+
+**Example:**
+
+```typescript
+import { usdToCoins } from "./src/utils/usdToCoins";
+
+usdToCoins(20, 80);    // → 0.25   (20 USDT buys 0.25 SOL at $80)
+usdToCoins(100, 77.56); // → 1.2892... (then rounded by roundTicks before ordering)
+usdToCoins(20, 95000); // → 0.0002105... BTC (then rounded to stepSize)
+```
+
+**Usage in `COMMIT_BUY_FN`:**
+
+```typescript
+// From commit_buy.function.ts
+const quantity = await formatQuantity(
+  symbol,
+  usdToCoins(amountUSDT, averagePrice),  // ← raw coin qty
+  binance
+  // formatQuantity internally rounds to LOT_SIZE stepSize via roundTicks
+);
+```
+
+---
+
+## getCoinName
+
+```typescript
+getCoinName(symbol: string): string
+```
+
+Strips the `"USDT"` suffix from a trading pair symbol to extract the base coin name.
+
+**Source:**
+
+```typescript
+type Coin = string;
+type Symbol = string;
+
+export const getCoinName = (symbol: Symbol): Coin => {
+  return symbol.split("USDT").join("");
+};
+```
+
+<Note>
+  After `COMMIT_BUY_FN` executes a purchase, `COMMIT_TRADE_FN` needs to measure
+  the quantity delta by looking up the coin in the balance map returned by
+  `FETCH_BALANCE_FN`. That map is keyed by coin name (e.g. `"SOL"`, `"BTC"`),
+  not by symbol — so `getCoinName` is the bridge between the two naming
+  conventions used throughout the codebase.
+</Note>
+
+<ParamField path="symbol" type="string" required>
+  A Binance spot trading pair symbol with a USDT quote, e.g. `"SOLUSDT"`, `"BTCUSDT"`, `"ETHUSDT"`.
+</ParamField>
+
+**Returns:** `string` — the base coin name with `"USDT"` removed.
+
+**Example:**
+
+```typescript
+import getCoinName from "./src/utils/getCoinName";
+
+getCoinName("SOLUSDT");       // → "SOL"
+getCoinName("BTCUSDT");       // → "BTC"
+getCoinName("FARTCOINUSDT");  // → "FARTCOIN"
+getCoinName("HBARUSDT");      // → "HBAR"
+```
+
+**Usage in `COMMIT_CANCEL_FN` and `COMMIT_TRADE_FN`:**
+
+```typescript
+// From commit_cancel.function.ts
+const coinName = getCoinName(symbol); // e.g. "SOL"
+
+const balanceMap = await FETCH_BALANCE_FN(binance);
+const balance = balanceMap[coinName]; // looks up "SOL" in the balance registry
+// balance = { quantity: 0.25, usdt: 19.39 }
+
+if (!balance) {
+  throw new Error(`Can't fetch balance (cancelation) for ${coinName}`);
+}
+```

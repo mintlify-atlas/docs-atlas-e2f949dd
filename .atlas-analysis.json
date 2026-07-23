@@ -1,0 +1,125 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "Wallet Manager",
+  "projectDescription": "A Binance spot wallet toolkit with an interactive REPL and reference broker-adapter flows for backtest-kit, encoding the correct order-management sequence (cancel pending orders, verify clean book, then sell) to serve as a foundation for any exchange adapter.",
+  "theme": "luma",
+  "primaryColor": "#F0B90B",
+  "lightColor": "#FCD535",
+  "darkColor": "#B8860B",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "REPL Guide",
+            "pages": [
+              "repl/overview",
+              "repl/read-commands",
+              "repl/mutating-commands"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/order-management",
+              "concepts/service-layer",
+              "concepts/di-architecture"
+            ]
+          },
+          {
+            "group": "Broker Adapter",
+            "pages": [
+              "broker/overview",
+              "broker/order-open",
+              "broker/order-close",
+              "broker/backtest-kit-integration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "WalletPublicService",
+            "pages": [
+              "api/wallet-public-service",
+              "api/commit-buy",
+              "api/commit-sell",
+              "api/commit-trade",
+              "api/commit-cancel",
+              "api/fetch-price",
+              "api/fetch-balance",
+              "api/fetch-fiat",
+              "api/fetch-orders",
+              "api/fetch-pnl"
+            ]
+          },
+          {
+            "group": "Core Functions",
+            "pages": [
+              "api/core-functions",
+              "api/utilities"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Interactive REPL for driving Binance spot orders without touching the trading engine",
+    "Correct order-management sequence: cancel pending orders, verify clean book, then sell",
+    "Per-symbol serialized execution queue preventing concurrent order conflicts",
+    "Limit order with poll-loop, cancel, and market-fallback pattern for guaranteed fills",
+    "commitCancel flattens a symbol: cancels all open orders and exits the entire free balance to USDT",
+    "commitTrade: buy + OCO (take-profit + stop-loss) in one atomic call",
+    "clientOrderId reconciliation pattern for idempotent order-open retries",
+    "Reference broker-adapter implementation for backtest-kit with OrderRejectedError terminal handling",
+    "DI-wired service layer over node-binance-api",
+    "Structured audit log after every commit (symbol, action, amountUSDT, averagePrice, date, status)"
+  ],
+  "publicApiSurface": [
+    "WalletPublicService.commitBuy(symbol, amountUSDT)",
+    "WalletPublicService.commitSell(symbol, amountUSDT)",
+    "WalletPublicService.commitTrade(symbol, amountUSDT, takeProfitPrice, stopLossPrice)",
+    "WalletPublicService.commitCancel(symbol)",
+    "WalletPublicService.commitReload(symbol)",
+    "WalletPublicService.fetchPrice(symbol)",
+    "WalletPublicService.fetchBalance(symbol)",
+    "WalletPublicService.fetchFiat(symbol)",
+    "WalletPublicService.fetchOrders(symbol, limit?)",
+    "WalletPublicService.fetchPnl(symbol, limit?)",
+    "WalletPrivateService.commitBuy(symbol, amountUSDT, averagePrice)",
+    "WalletPrivateService.commitSell(symbol, amountUSDT, averagePrice)",
+    "WalletPrivateService.commitTrade(symbol, amountUSDT, averagePrice, takeProfitPrice, stopLossPrice)",
+    "WalletPrivateService.commitCancel(symbol, averagePrice)",
+    "WalletPrivateService.fetchBalance()",
+    "WalletPrivateService.fetchPrice(symbol)",
+    "WalletPrivateService.fetchFiat()",
+    "WalletPrivateService.fetchOrders(symbol, limit)",
+    "WalletPrivateService.fetchPnl(symbol, limit)",
+    "WalletPrivateService.clear()",
+    "COMMIT_BUY_FN({ symbol, amountUSDT, averagePrice }, binance)",
+    "COMMIT_SELL_FN({ symbol, amountUSDT, averagePrice }, binance)",
+    "COMMIT_CANCEL_FN({ symbol, averagePrice }, binance)",
+    "COMMIT_TRADE_FN({ symbol, amountUSDT, averagePrice, takeProfitPrice, stopLossPrice }, binance)",
+    "FETCH_BALANCE_FN(binance)",
+    "FETCH_PRICE_FN({ symbol }, binance)",
+    "FETCH_FIAT_FN(binance)",
+    "FETCH_ORDERS_FN({ symbol, limit }, binance)",
+    "FETCH_PNL_FN({ orders, symbol }, binance)",
+    "wallet (default export: { walletPublicService, walletPrivateService })",
+    "roundTicks(price, tickSize)",
+    "percentValue(value, percent)",
+    "usdToCoins(quantity, price)",
+    "getCoinName(symbol)"
+  ]
+}

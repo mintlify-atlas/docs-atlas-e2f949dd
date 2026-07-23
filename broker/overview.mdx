@@ -1,0 +1,90 @@
+---
+title: "Broker Adapter Overview: Wiring Wallet Manager to backtest-kit"
+sidebarTitle: "Overview"
+description: "Wallet Manager provides the canonical exchange side of a backtest-kit broker adapter, encoding three rules that prevent orphaned orders, duplicate entries, and infinite retries."
+---
+
+## What is a backtest-kit broker adapter?
+
+A backtest-kit broker adapter is the bridge between the backtest-kit engine's trading signals and a real exchange. The engine emits signals — open a position, close a position, check if an order is still active — and the adapter translates those signals into concrete API calls against the exchange.
+
+Wallet Manager's `src/function/` layer contains the exact order-management flows (post → poll → cancel → market fallback) that the reference `SpotBroker` adapter is built from. When the engine fires `onOrderOpenCommit`, the adapter places a limit BUY on Binance, polls for fill, and handles timeouts without leaving orphaned orders on the book. When the engine fires `onOrderCloseCommit`, the adapter cancels every open order on the symbol and sells the entire free coin balance to USDT.
+
+## The three rules
+
+Spot trading over a retry-capable engine creates three distinct failure modes. The `SpotBroker` reference adapter encodes exactly one fix for each.
+
+### Rule 1 — A transient throw must never leave an order resting on the exchange
+
+Before throwing any error that will be retried, the adapter **cancels the unfilled order** and **market-sells any partial fill**. Without this, every "will retry" appends one more live order to the book — orders that can fill independently, creating positions the engine knows nothing about.
+
+```
+timeout → cancel open order → market-sell executedQty → throw Error (transient)
+```
+
+### Rule 2 — `attempt > 0` means the previous attempt may have reached the exchange
+
+The engine passes `attempt` on every retry precisely so the adapter can reconcile state. Before posting a new BUY, the adapter queries by `origClientOrderId: signalId`. If the prior order was `FILLED`, it returns early — "already bought". If it is `NEW` or `PARTIALLY_FILLED`, it cancels the stale remainder before re-submitting.
+
+```
+attempt > 0 → query by origClientOrderId (= signalId)
+  FILLED          → return (already bought, confirm silently)
+  NEW / PARTIAL   → cancel stale remainder → re-submit fresh order
+  not found/null  → proceed normally
+```
+
+<Note>
+Binance's duplicate `clientOrderId` guard only covers **open** orders. An instantly filled order would not be deduplicated — which is exactly why the reconcile step exists.
+</Note>
+
+### Rule 3 — The fifth attempt is terminal
+
+The engine's default retry budget is `CC_ORDER_OPEN_RETRY_ATTEMPTS = 5`, so `attempt` arrives as `0`–`4`. When `attempt === 4` (`>= LAST_OPEN_ATTEMPT`), the adapter cancels the order, market-sells whatever was actually bought (`executedQty`), and throws `OrderRejectedError` — **not** a plain `Error`.
+
+`OrderRejectedError` is the terminal signal: the engine consumes the `signalId` into `lastPendingId` and never re-issues it. A plain `Error` is treated as transient and the engine keeps retrying indefinitely.
+
+```
+attempt >= 4 → cancel → market-sell executedQty → throw OrderRejectedError
+```
+
+## Adapter class structure
+
+The adapter extends `BrokerBase` and overrides two hooks:
+
+| Hook | Responsibility |
+|---|---|
+| `onOrderOpenCommit` | Place limit BUY, poll fill, cancel + roll back on timeout, reconcile on retry |
+| `onOrderCloseCommit` | Cancel all open orders, verify clean book, sell entire free balance |
+
+`BrokerBase` provides safe defaults for all other hooks — `onOrderActiveCheck`, `onPartialCommit`, and the rest — so only the two core commit methods need to be implemented.
+
+Registration is two lines:
+
+```typescript
+Broker.useBrokerAdapter(SpotBroker);
+Broker.enable();
+```
+
+## Key constants
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `FILL_POLL_ATTEMPTS` | `10` | Number of fill-status checks before declaring a timeout |
+| `FILL_POLL_INTERVAL_MS` | `10_000` | Milliseconds between each poll — 10 checks × 10 s = ~100 s total wait |
+| `LAST_OPEN_ATTEMPT` | `4` | The `attempt` index that triggers terminal rejection (fifth attempt, 0-indexed) |
+| `CANCEL_ROUNDS` | `10` | Maximum cancel-sweep iterations when flattening the symbol on close |
+| `TRADE_SELL_LOWER_PERCENT` | `0.999` | Exit limit price multiplier — 0.1 % below market for faster fills |
+
+## Pages in this section
+
+<CardGroup cols={2}>
+  <Card title="Order Open" icon="arrow-up-right" href="/broker/order-open">
+    Step-by-step walkthrough of `onOrderOpenCommit`: limit BUY placement, fill polling, timeout handling, retry reconciliation, and terminal rejection.
+  </Card>
+  <Card title="Order Close" icon="arrow-down-left" href="/broker/order-close">
+    Step-by-step walkthrough of `onOrderCloseCommit`: cancel sweep, clean-book verification, and full free-balance sell to USDT.
+  </Card>
+  <Card title="Integration Example" icon="code" href="/broker/backtest-kit-integration">
+    Complete `SpotBroker` TypeScript class from the README, helper function reference, and CLI dry-fire instructions.
+  </Card>
+</CardGroup>

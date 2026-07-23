@@ -1,0 +1,217 @@
+---
+title: "REPL Read Commands: Inspect Prices, Balances, and Orders"
+sidebarTitle: "Read Commands"
+description: "Use fetchPrice, fetchFiat, fetchBalance, fetchOrders, and fetchPnl to inspect your Binance spot wallet state without placing orders."
+---
+
+Read commands never place orders. They are safe to call at any time and are the right tool for sanity-checking market state before issuing a mutating command.
+
+All examples below use `wallet.walletPublicService`, which runs each call through the per-symbol queue and validation layer. See the [Overview](/repl/overview) for why this is the recommended surface.
+
+---
+
+## fetchPrice
+
+Returns the current average market price for a symbol as a plain `number`.
+
+**Caching:** result is cached for **30 seconds** per symbol. Subsequent calls within that window return the cached value without hitting the exchange.
+
+<ParamField path="symbol" type="string" required>
+  The Binance trading pair, e.g. `"SOLUSDT"`, `"BTCUSDT"`.
+</ParamField>
+
+**Return type:** `Promise<number>` — the average price in USDT.
+
+**REPL example:**
+
+```
+repl => await wallet.walletPublicService.fetchPrice("SOLUSDT")
+77.56
+```
+
+---
+
+## fetchFiat
+
+Returns the total USDT balance — the sum of **free** and **locked** USDT — as a plain `number`.
+
+<ParamField path="symbol" type="string" required>
+  The trading pair whose quote currency balance you want to check. For all standard USDT pairs this returns your overall USDT balance (free + locked across all open orders).
+</ParamField>
+
+**Return type:** `Promise<number>` — total USDT balance (free + locked).
+
+**REPL example:**
+
+```
+repl => await wallet.walletPublicService.fetchFiat("SOLUSDT")
+430.12
+```
+
+Use this before calling `commitBuy` to verify you have enough free USDT. `commitBuy` itself returns `0` early when free USDT is below the requested amount, but checking ahead of time helps diagnose why.
+
+---
+
+## fetchBalance
+
+Returns the coin balance for the base asset of the given symbol as `{ quantity, usdt }`.
+
+<ParamField path="symbol" type="string" required>
+  The Binance trading pair, e.g. `"SOLUSDT"`. The base coin (e.g. `SOL`) is extracted automatically.
+</ParamField>
+
+**Return type:** `Promise<{ quantity: number; usdt: number }>`
+
+| Field | Description |
+|---|---|
+| `quantity` | Total coin held, **including** amounts locked in open orders (`onOrder`). |
+| `usdt` | The USDT-equivalent value of that coin at the current price. |
+
+**REPL example:**
+
+```
+repl => await wallet.walletPublicService.fetchBalance("SOLUSDT")
+{
+  "quantity": 5.21,
+  "usdt": 404.69
+}
+```
+
+<Note>
+  `quantity` reflects the total balance including any coins locked in pending SELL orders. It is **not** the amount available to trade right now — check open orders with `fetchOrders` if you need to know the unlocked portion.
+</Note>
+
+---
+
+## fetchOrders
+
+Returns recent orders for a symbol — filled, canceled, and still open — with full side, price, quantity, and timestamp detail.
+
+**Caching:** results are cached for **10 minutes** per `(symbol, limit)` pair. The cache is automatically cleared after any `commit*` call on the same symbol.
+
+<ParamField path="symbol" type="string" required>
+  The Binance trading pair.
+</ParamField>
+
+<ParamField path="limit" type="number" default="25">
+  Maximum number of orders to return. Defaults to `25`.
+</ParamField>
+
+**Return type:** `Promise<IOrderData[]>`
+
+```typescript
+interface IOrderData {
+  symbol:      string;
+  orderId:     number;
+  status:      "FILLED" | "CANCELED" | "NEW";
+  side:        "BUY" | "SELL";
+  price:       string;   // limit price set on the order
+  amount:      string;   // original order quantity
+  executedQty: string;   // quantity actually filled so far
+  time:        string;   // ISO timestamp of order creation
+}
+```
+
+**REPL example:**
+
+```
+repl => await wallet.walletPublicService.fetchOrders("SOLUSDT", 5)
+[
+  {
+    "symbol": "SOLUSDT",
+    "orderId": 3849201,
+    "status": "FILLED",
+    "side": "BUY",
+    "price": "77.64",
+    "amount": "0.25",
+    "executedQty": "0.25",
+    "time": "2024-11-14T09:55:00.000Z"
+  },
+  {
+    "symbol": "SOLUSDT",
+    "orderId": 3849345,
+    "status": "CANCELED",
+    "side": "SELL",
+    "price": "82.00",
+    "amount": "0.25",
+    "executedQty": "0.00",
+    "time": "2024-11-14T10:01:15.000Z"
+  }
+]
+```
+
+Dump a larger history to a file for offline review:
+
+```
+repl => const orders = await wallet.walletPublicService.fetchOrders("SOLUSDT", 100)
+repl => fs.writeFileSync("orders.json", JSON.stringify(orders, null, 2))
+```
+
+---
+
+## fetchPnl
+
+Returns a daily PnL estimate for a symbol reconstructed from your trade history combined with 1-hour VWAP candle data.
+
+**Caching:** results are cached for **10 minutes** per `(symbol, limit)` pair.
+
+<ParamField path="symbol" type="string" required>
+  The Binance trading pair.
+</ParamField>
+
+<ParamField path="limit" type="number" default="25">
+  Number of days to include in the estimate. Defaults to `25`.
+</ParamField>
+
+**Return type:** `Promise<IDailyPnL[]>`
+
+```typescript
+interface IDailyPnL {
+  date:         string; // "YYYY-MM-DD"
+  pnl:          string; // estimated profit/loss in USDT for that day
+  walletCost:   string; // USDT cost basis of the position on that day
+  amountQty:    string; // coin quantity held that day
+  amountUSDT:   string; // USDT value of holdings at day-end price
+  averagePrice: string; // VWAP-derived average cost per coin
+}
+```
+
+| Field | Description |
+|---|---|
+| `date` | Calendar day this row covers (`"YYYY-MM-DD"`). |
+| `pnl` | Estimated daily profit/loss in USDT. Positive = gain, negative = loss. |
+| `walletCost` | The USDT cost basis carried into that day. |
+| `amountQty` | Coin quantity attributed to that day's activity. |
+| `amountUSDT` | USDT value of those coins at that day's closing price. |
+| `averagePrice` | The average price derived from 1h VWAP candles. |
+
+**REPL example:**
+
+```
+repl => await wallet.walletPublicService.fetchPnl("SOLUSDT", 7)
+[
+  {
+    "date": "2024-11-13",
+    "pnl": "1.84",
+    "walletCost": "154.20",
+    "amountQty": "2.00",
+    "amountUSDT": "156.04",
+    "averagePrice": "78.02"
+  },
+  {
+    "date": "2024-11-14",
+    "pnl": "-0.62",
+    "walletCost": "156.04",
+    "amountQty": "2.00",
+    "amountUSDT": "155.42",
+    "averagePrice": "77.71"
+  }
+]
+```
+
+To save a 90-day PnL report:
+
+```
+repl => const pnl = await wallet.walletPublicService.fetchPnl("SOLUSDT", 90)
+repl => fs.writeFileSync("pnl-90d.json", JSON.stringify(pnl, null, 2))
+```

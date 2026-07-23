@@ -1,0 +1,110 @@
+---
+title: "commitBuy: Guarded Limit Entry on Binance Spot"
+sidebarTitle: "commitBuy"
+description: "commitBuy places a guarded limit BUY order at avg×1.001, polls for fill every 10s up to 10 times, and falls back to a market buy on timeout. Returns 0 if guards fail."
+---
+
+`commitBuy` is the primary entry function for opening a long position on Binance spot. Before placing any order it checks two guards — open orders on the symbol and available USDT balance — and returns `0` immediately if either guard fails, leaving the exchange untouched. When the guards pass, it places a limit BUY order priced slightly above the current average to improve fill probability, then waits up to 100 seconds for the fill. If the order has not filled by then, it cancels the resting limit order and market-buys whatever quantity is still unfilled, guaranteeing the entry is completed rather than left as a resting order on the book.
+
+## Signature
+
+```typescript
+commitBuy(symbol: string, amountUSDT: number): Promise<number>
+```
+
+## Parameters
+
+<ParamField path="symbol" type="string" required>
+  Binance trading pair symbol, e.g. `"SOLUSDT"`. Must be a valid spot symbol listed on Binance.
+</ParamField>
+
+<ParamField path="amountUSDT" type="number" required>
+  Amount in USDT to spend on the buy. Validated in `WalletPublicService` — must be a finite number and must be `≥ 0`. Throws if `typeof amountUSDT !== "number"`, if the value is `NaN`, or if it is negative.
+</ParamField>
+
+## Return value
+
+`Promise<number>` — the average fill price computed from the order's `fills` array (arithmetic mean over fill prices). Returns `0` if either guard prevented the trade.
+
+## Guards
+
+`commitBuy` checks two pre-conditions before placing any order. If either fails, the function returns `0` without touching the exchange:
+
+1. **Open orders guard** — calls `binance.openOrders(symbol)`. If the symbol already has one or more live orders, returns `0`. This prevents stacking a new buy on top of a locked position.
+2. **Balance guard** — reads the free USDT balance from `binance.account()`. If `freeUSDT < amountUSDT`, returns `0`.
+
+## Order logic
+
+1. **Limit price** — `averagePrice × 1.001` (0.1% above the 5-minute weighted average), formatted to the symbol's `PRICE_FILTER` `tickSize`.
+2. **Quantity** — `amountUSDT / averagePrice` converted to coins via `usdToCoins()`, then formatted to the `LOT_SIZE` `stepSize`.
+3. A `LIMIT BUY` order is placed via `binance.order("LIMIT", "BUY", symbol, quantity, price)`.
+
+## Poll loop
+
+If the order is not instantly `FILLED`, `commitBuy` enters a poll loop:
+
+- **10 iterations** × **10-second sleep** = up to **100 seconds** waiting for the fill.
+- Each iteration calls `binance.orderStatus(symbol, orderId)` and breaks as soon as `status === "FILLED"`.
+
+## Timeout fallback
+
+If all 10 poll iterations complete without a fill:
+
+1. The resting limit order is **cancelled** via `binance.cancel(symbol, orderId)`.
+2. The unfilled remainder (`quantity - lastStatus.executedQty`) is **market-bought** via `binance.marketBuy(symbol, remainderQty)`.
+3. The average price from the market order's `fills` array is returned.
+
+This guarantees the position is always opened — the entry never stays as a resting order past the poll window.
+
+## Validation in WalletPublicService
+
+Before the order flow runs, `WalletPublicService.commitBuy` validates `amountUSDT`:
+
+```typescript
+if (typeof amountUSDT !== "number" || isNaN(amountUSDT)) {
+  throw new Error("amountUSDT must be a valid number");
+}
+if (amountUSDT < 0) {
+  throw new Error("amountUSDT must be greater than zero");
+}
+```
+
+The current `averagePrice` is also fetched at this point (before enqueuing) so the queued runner receives a consistent snapshot price, not a price that could drift while waiting in the queue.
+
+## Audit log
+
+After the operation completes (success or failure), `WalletPublicService` emits:
+
+```typescript
+console.log({
+  symbol,
+  action: "buy",
+  amountUSDT,
+  averagePrice,
+  date: new Date(),
+  status: "success" | "failed",
+});
+```
+
+## Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// REPL usage:
+// repl => await wallet.walletPublicService.commitBuy("SOLUSDT", 20)
+
+const fillPrice = await walletPublicService.commitBuy("SOLUSDT", 20);
+
+if (fillPrice === 0) {
+  console.log("Guards prevented entry: open orders exist or insufficient USDT balance");
+} else {
+  console.log(`Filled at average price: ${fillPrice}`);
+}
+```
+
+<Note>
+  The `averagePrice` passed to the underlying `COMMIT_BUY_FN` is the 5-minute Binance weighted average price fetched by `WalletPublicService` **before** the call is enqueued. If the symbol is busy and the call waits in the queue for a while, the price used for the limit order will be the price at enqueue time, not at execution time.
+</Note>

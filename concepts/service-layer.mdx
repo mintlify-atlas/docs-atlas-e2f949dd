@@ -1,0 +1,298 @@
+---
+title: "Service Layer: WalletPublicService vs WalletPrivateService"
+sidebarTitle: "Service Layer"
+description: "Wallet Manager exposes two service layers: WalletPublicService adds per-symbol queuing, argument validation, and audit logging on top of the raw WalletPrivateService."
+---
+
+## Two-Layer Architecture
+
+Wallet Manager separates concerns into two distinct service classes:
+
+| Feature | `WalletPublicService` | `WalletPrivateService` |
+|---|---|---|
+| **Recommended for** | All normal usage | Debugging and internals |
+| **Per-symbol queue** | ✅ Serialized via `queued` | ❌ No queueing |
+| **Argument validation** | ✅ Type + range checks before every call | ❌ None |
+| **Audit log** | ✅ `console.log` after every commit | ❌ None |
+| **TTL cache** | Delegates to private | ✅ `fetchOrders` and `fetchPnl` (10 min) |
+| **Price cache** | Delegates to private | ✅ 30-second ticker via `FETCH_PRICE_FN` |
+| **GC timer** | — | ✅ `Source.fromInterval(30s)` |
+| **Cache invalidation** | Calls `clear()` after every commit | ✅ Exposes `clear()` |
+| **Access** | `wallet.walletPublicService` | `wallet.walletPrivateService` |
+
+<Note>
+  Always use `walletPublicService` for interactive and programmatic use.
+  `walletPrivateService` is exposed primarily so you can inspect raw
+  exchange responses during debugging without the queue or validation layer.
+</Note>
+
+---
+
+## Method Signatures
+
+Both services share the same functional surface area. Below are the full
+type signatures from `types.d.ts`:
+
+### `WalletPublicService`
+
+```typescript
+declare class WalletPublicService {
+  commitBuy(symbol: string, amountUSDT: number): Promise<number>;
+  commitSell(symbol: string, amountUSDT: number): Promise<number>;
+  commitTrade(
+    symbol: string,
+    amountUSDT: number,
+    takeProfitPrice: number,
+    stopLossPrice: number
+  ): Promise<0 | { status: string; content: string }>;
+  commitCancel(symbol: string): Promise<number>;
+  commitReload(symbol: string): Promise<void>;
+
+  fetchBalance(symbol: string): Promise<{ usdt: number; quantity: number }>;
+  fetchOrders(symbol: string, limit?: number): Promise<IOrderData[]>;
+  fetchPrice(symbol: string): Promise<number>;
+  fetchFiat(symbol: string): Promise<number>;
+  fetchPnl(symbol: string, limit?: number): Promise<IDailyPnL[]>;
+}
+```
+
+### `WalletPrivateService`
+
+```typescript
+declare class WalletPrivateService {
+  commitTrade(
+    symbol: string,
+    amountUSDT: number,
+    averagePrice: number,
+    takeProfitPrice: number,
+    stopLossPrice: number
+  ): Promise<0 | { status: string; content: string }>;
+  commitCancel(symbol: string, averagePrice: number): Promise<number>;
+  commitBuy(symbol: string, amountUSDT: number, averagePrice: number): Promise<number>;
+  commitSell(symbol: string, amountUSDT: number, averagePrice: number): Promise<number>;
+
+  fetchBalance(): Promise<Record<string, { usdt: number; quantity: number }>>;
+  fetchPrice(symbol: string): Promise<number>;
+  fetchFiat(): Promise<number>;
+  fetchOrders(symbol: string, limit: number): Promise<IOrderData[]>; // TTL cached
+  fetchPnl(symbol: string, limit: number): Promise<IDailyPnL[]>;    // TTL cached
+
+  clear(): void;
+}
+```
+
+The key difference: `WalletPrivateService` requires callers to pass
+`averagePrice` explicitly. `WalletPublicService` fetches the current price
+internally before dispatching to the private layer — ensuring the limit
+price is always fresh from the exchange.
+
+---
+
+## Per-Symbol Queuing
+
+`WalletPublicService` uses `memoize` from `functools-kit` to maintain a
+**separate `EventListener` instance per symbol**. Each `EventListener`
+wraps all calls through a single `queued` executor:
+
+```typescript
+// WalletPublicService.ts (simplified)
+private getRunner = memoize<(symbol: string) => EventListener>(
+  ([symbol]) => `${symbol}`,
+  () => new EventListener(this.walletPrivateService)
+);
+```
+
+```typescript
+// EventListener (inside WalletPublicService.ts)
+public execute = queued(
+  async (symbol: string, methodName: MethodName, ...args: any[]) => {
+    // all calls for this symbol are serialized here
+  }
+);
+```
+
+The result:
+
+- Calls on **the same symbol** are automatically serialized. A second
+  `commitBuy("SOLUSDT", 20)` cannot start until the first has fully
+  resolved, preventing double-entry.
+- Calls on **different symbols** (e.g. `SOLUSDT` and `BTCUSDT`) run
+  concurrently — one symbol's queue never blocks another's.
+
+---
+
+## Audit Logging
+
+After every commit method resolves (or rejects), `WalletPublicService`
+writes a structured record to `console.log`:
+
+```typescript
+// Emitted in the `finally` block of commitBuy, commitSell, commitTrade,
+// and commitCancel:
+console.log({
+  symbol,
+  action: "buy",       // "buy" | "sell" | "trade" | "cancel"
+  amountUSDT,
+  averagePrice,
+  date: new Date(),
+  status: isOk ? "success" : "failed",
+});
+```
+
+The `status` field is set to `"failed"` only when the underlying call threw
+an exception — the log is emitted regardless, giving you a complete timeline
+of every attempted operation.
+
+---
+
+## Argument Validation
+
+Before queuing any commit, `WalletPublicService` validates the incoming
+arguments and throws descriptive errors early:
+
+```typescript
+// commitBuy / commitSell
+if (typeof amountUSDT !== "number" || isNaN(amountUSDT)) {
+  throw new Error("amountUSDT must be a valid number");
+}
+if (amountUSDT < 0) {
+  throw new Error("amountUSDT must be greater than zero");
+}
+
+// commitTrade (additional price-relationship checks)
+if (stopLossPrice > takeProfitPrice) {
+  throw new Error("stop-loss price is greater than take-profit price");
+}
+if (takeProfitPrice <= averagePrice) {
+  throw new Error("take-profit price must be greater than average price");
+}
+if (stopLossPrice >= averagePrice) {
+  throw new Error("stop-loss price must be less than average price");
+}
+```
+
+These checks run _before_ the call enters the symbol queue, so bad
+arguments never consume a queue slot or touch the exchange.
+
+---
+
+## TTL Caching in `WalletPrivateService`
+
+Two methods are wrapped with `ttl` from `functools-kit` to avoid hammering
+the Binance REST API for data that changes infrequently:
+
+```typescript
+// WalletPrivateService.ts
+const ORDERS_TTL = 10 * 60 * 1_000;  // 10 minutes
+const PNL_TTL    = 10 * 60 * 1_000;  // 10 minutes
+
+public fetchOrders = ttl(
+  async (symbol: string, limit: number) => { /* ... */ },
+  {
+    timeout: ORDERS_TTL,
+    key: ([symbol, limit]) => `${symbol}-${limit}`,
+  }
+);
+
+public fetchPnl = ttl(
+  async (symbol: string, limit: number) => { /* ... */ },
+  {
+    timeout: PNL_TTL,
+    key: ([symbol, limit]) => `${symbol}-${limit}`,
+  }
+);
+```
+
+The cache key is `"${symbol}-${limit}"`, so `fetchOrders("SOLUSDT", 25)`
+and `fetchOrders("SOLUSDT", 50)` are cached independently.
+
+`fetchPrice` (via `FETCH_PRICE_FN`) uses its own **30-second TTL ticker
+cache** inside the underlying function.
+
+---
+
+## GC Timer
+
+Keeping indefinitely-growing TTL caches in memory would be a leak. A
+`Source.fromInterval` timer fires every 30 seconds to run GC on both caches:
+
+```typescript
+// WalletPrivateService.ts
+const WALLET_GC_TTL = 30 * 1_000;
+
+protected init = singleshot(async () => {
+  // ...
+  Source.fromInterval(WALLET_GC_TTL).connect(() => {
+    this.fetchPnl.gc();
+    this.fetchOrders.gc();
+  });
+});
+```
+
+GC evicts entries whose TTL has already expired. Entries for symbols you
+have stopped querying are cleaned up automatically within 30 seconds of
+their TTL expiry.
+
+---
+
+## Cache Invalidation with `clear()`
+
+After every commit (`commitBuy`, `commitSell`, `commitTrade`,
+`commitCancel`), `WalletPublicService` calls `walletPrivateService.clear()`
+in its `finally` block:
+
+```typescript
+// WalletPublicService.ts — finally block of every commit method
+} finally {
+  console.log({ symbol, action, amountUSDT, averagePrice, date, status });
+  this.walletPrivateService.clear();
+}
+```
+
+`clear()` flushes both TTL caches entirely:
+
+```typescript
+// WalletPrivateService.ts
+public clear = () => {
+  this.fetchPnl.clear();
+  this.fetchOrders.clear();
+};
+```
+
+This guarantees that the next `fetchOrders` or `fetchPnl` call after a
+trade always fetches fresh data from Binance, not a pre-trade snapshot.
+
+---
+
+## The `wallet` Export
+
+Both services are assembled into a single `wallet` object in `src/index.ts`
+and exported as the package's public API:
+
+```typescript
+const wallet = {
+  walletPrivateService: inject<WalletPrivateService>(TYPES.walletPrivateService),
+  walletPublicService:  inject<WalletPublicService>(TYPES.walletPublicService),
+};
+
+export { wallet };
+export default wallet;
+
+// Also assigned to globalThis for REPL access:
+Object.assign(globalThis, { wallet });
+```
+
+In the REPL, `wallet` is available as a global:
+
+```
+repl => await wallet.walletPublicService.fetchPrice("SOLUSDT")
+77.56
+```
+
+When used as a library, import it directly:
+
+```typescript
+import { wallet } from "wallet-manager";
+
+const price = await wallet.walletPublicService.fetchPrice("SOLUSDT");
+```

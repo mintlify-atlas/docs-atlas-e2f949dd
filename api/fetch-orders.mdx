@@ -1,0 +1,104 @@
+---
+title: "fetchOrders: Recent Order History with Status"
+sidebarTitle: "fetchOrders"
+description: "fetchOrders returns recent FILLED, CANCELED, and NEW orders for a symbol, combining open orders from openOrders with completed trades from the trades endpoint."
+---
+
+`fetchOrders` returns a unified, time-sorted list of recent orders for a symbol, merging pending open orders (status `NEW`) with completed trade history (status `FILLED` or `CANCELED`). The result gives a complete picture of recent activity on a symbol without requiring separate calls to the open-orders and trade-history endpoints. Results are cached for 10 minutes per `(symbol, limit)` key to avoid hammering the Binance rate limits during repeated inspection.
+
+## Signature
+
+```typescript
+fetchOrders(symbol: string, limit?: number): Promise<IOrderData[]>
+```
+
+## Parameters
+
+<ParamField path="symbol" type="string" required>
+  Binance trading pair symbol, e.g. `"SOLUSDT"`.
+</ParamField>
+
+<ParamField path="limit" type="number">
+  Maximum number of completed (FILLED / CANCELED) orders to retrieve from the trade history endpoint. Defaults to `25`. Open orders (NEW) are always included in addition to this count and are prepended to the result.
+</ParamField>
+
+## Return value
+
+`Promise<IOrderData[]>` — an array sorted newest-first, combining open orders and completed trade history.
+
+<ResponseField name="IOrderData" type="object">
+  A single order record.
+
+  <Expandable title="IOrderData fields">
+    <ResponseField name="symbol" type="string">
+      Trading pair symbol, e.g. `"SOLUSDT"`.
+    </ResponseField>
+    <ResponseField name="orderId" type="number">
+      Binance order ID (integer).
+    </ResponseField>
+    <ResponseField name="status" type='"FILLED" | "CANCELED" | "NEW"'>
+      Order status. `"NEW"` means the order is still open and resting on the book.
+    </ResponseField>
+    <ResponseField name="amount" type="string">
+      Original requested quantity (`origQty`) as a string, in base coin units.
+    </ResponseField>
+    <ResponseField name="executedQty" type="string">
+      Quantity actually filled so far, as a string. May differ from `amount` for partially filled or cancelled orders.
+    </ResponseField>
+    <ResponseField name="price" type="string">
+      Order price as a string. For market orders this reflects the trade price; for limit orders, the limit price.
+    </ResponseField>
+    <ResponseField name="time" type="string">
+      Order creation timestamp in ISO 8601 format, e.g. `"2025-01-15T14:32:10.000Z"`.
+    </ResponseField>
+    <ResponseField name="side" type='"BUY" | "SELL"'>
+      Order side.
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+## How the result is assembled
+
+The function combines two sources:
+
+1. **Completed orders** — fetched via `binance.trades(symbol, { limit })`, deduplicated by `orderId`, sorted newest-first, then enriched with `status`, `origQty`, and `executedQty` from `binance.orderStatus()`.
+2. **Open orders** — fetched via `binance.openOrders(symbol)`, sorted newest-first, mapped to the same `IOrderData` shape.
+
+The final result is `[...pendingOrders, ...finishedOrders]` — open orders always appear first, followed by the completed history.
+
+## Caching
+
+`WalletPrivateService.fetchOrders` is wrapped with `ttl` from `functools-kit`:
+
+- **TTL**: 10 minutes (`600_000` ms) per `(symbol, limit)` cache key.
+- The cache is **invalidated** by any `commit*` call, because `WalletPublicService` calls `walletPrivateService.clear()` in its `finally` block after every commit operation.
+- A GC sweep runs every 30 seconds to evict expired entries from memory.
+
+## Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// REPL usage:
+// repl => await wallet.walletPublicService.fetchOrders("SOLUSDT", 25)
+
+const orders = await walletPublicService.fetchOrders("SOLUSDT", 25);
+
+orders.forEach((order) => {
+  console.log(
+    `[${order.time}] ${order.side} ${order.executedQty}/${order.amount} @ ${order.price} — ${order.status}`
+  );
+});
+
+// Filter to only filled buys
+const filledBuys = orders.filter(
+  (o) => o.status === "FILLED" && o.side === "BUY"
+);
+console.log(`Filled buys: ${filledBuys.length}`);
+```
+
+<Note>
+  The `limit` parameter controls how many orders are fetched from the **trade history** endpoint, not the total result count. Open orders (NEW) are always appended on top, so the actual array length may exceed `limit` if you have many pending orders on the symbol.
+</Note>

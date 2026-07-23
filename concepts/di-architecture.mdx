@@ -1,0 +1,212 @@
+---
+title: "Dependency Injection Architecture in Wallet Manager"
+sidebarTitle: "DI Architecture"
+description: "Wallet Manager uses di-kit and di-scoped for inversion-of-control wiring, binding WalletPrivateService and WalletPublicService to DI symbols resolved at startup."
+---
+
+## Why Dependency Injection?
+
+Wallet Manager constructs its services through an inversion-of-control (IoC)
+container rather than having code call `new WalletPrivateService()` directly.
+This gives three practical benefits:
+
+1. **Decoupled construction.** Service consumers declare what they need (a
+   symbol); the container decides how to build and wire it. Swapping the
+   Binance backend for a different exchange would only require changing the
+   `provide` registrations — nothing that calls the services needs to change.
+
+2. **Singleton lifecycle.** Each service is constructed exactly once, no
+   matter how many places inject it. The `WalletPublicService`'s inner
+   `memoize`-based per-symbol runner and the `WalletPrivateService`'s TTL
+   caches are shared state that must not be duplicated.
+
+3. **Testability.** `override(TYPES.walletPrivateService, () => mockService)`
+   replaces a real service with a test double without modifying any call
+   site.
+
+---
+
+## DI Dependencies
+
+Wallet Manager uses two packages from the same ecosystem:
+
+| Package | Role |
+|---|---|
+| `di-kit` | Core IoC container. Provides `createActivator`, which yields `provide`, `inject`, `init`, and `override`. |
+| `di-scoped` | Scoped injection support (used internally for lifecycle management). |
+
+---
+
+## DI Symbols (`src/core/types.ts`)
+
+Every service is identified by a well-known `Symbol`. Using `Symbol.for`
+(rather than `Symbol()`) produces a global registry symbol — two calls to
+`Symbol.for('walletPrivateService')` in different modules return the
+**same** symbol, making cross-module injection reliable.
+
+```typescript
+// src/core/types.ts
+const privateServices = {
+  walletPrivateService: Symbol.for('walletPrivateService'),
+};
+
+const publicServices = {
+  walletPublicService: Symbol.for('walletPublicService'),
+};
+
+export const TYPES = {
+  ...privateServices,
+  ...publicServices,
+};
+```
+
+`TYPES` is the single source of truth for DI keys. Both the `provide`
+registration and every `inject` call reference `TYPES.walletPrivateService`
+or `TYPES.walletPublicService` — never raw strings.
+
+---
+
+## The `di` File (`src/core/di.ts`)
+
+`di.ts` creates the activator (the DI container instance) and re-exports the
+four functions that the rest of the codebase uses:
+
+```typescript
+// src/core/di.ts
+import { createActivator } from "di-kit";
+
+export const { provide, inject, init, override } = createActivator("wallet");
+```
+
+| Export | Purpose |
+|---|---|
+| `provide(symbol, factory)` | Registers a factory function against a DI symbol. |
+| `inject<T>(symbol)` | Resolves the service bound to the symbol. |
+| `init()` | Runs the container's startup sequence (calls `init` on every registered service that has one). |
+| `override(symbol, factory)` | Replaces a registration — useful in tests. |
+
+All four originate from the same `"wallet"` activator instance, so they
+share a single service registry.
+
+---
+
+## Service Registration (`src/core/provide.ts`)
+
+`provide.ts` registers both services by calling `provide` with a zero-arg
+factory:
+
+```typescript
+// src/core/provide.ts
+import WalletPrivateService from "../services/private/WalletPrivateService";
+import WalletPublicService from "../services/public/WalletPublicService";
+import { provide } from "./di";
+import { TYPES } from "./types";
+
+{
+  provide(TYPES.walletPrivateService, () => new WalletPrivateService());
+}
+
+{
+  provide(TYPES.walletPublicService, () => new WalletPublicService());
+}
+```
+
+The factories are lazy — the container only calls `new WalletPrivateService()`
+the first time someone resolves `TYPES.walletPrivateService`. Subsequent
+calls to `inject(TYPES.walletPrivateService)` return the cached instance.
+
+<Note>
+  `WalletPublicService` itself calls `inject(TYPES.walletPrivateService)`
+  inside its constructor — the container resolves `WalletPrivateService`
+  first and passes the same instance every time, so both services share
+  the same cache and `clear()` state.
+</Note>
+
+---
+
+## Startup Wiring (`src/index.ts`)
+
+`index.ts` is the entry point that ties everything together:
+
+```typescript
+// src/index.ts
+
+// 1. Import provide.ts to register factories before any inject calls
+import "./core/provide";
+
+import { init, inject } from "./core/di";
+import { TYPES } from "./core/types";
+import WalletPrivateService from "./services/private/WalletPrivateService";
+import WalletPublicService from "./services/public/WalletPublicService";
+
+// 2. Resolve both services from the DI container
+const privateServices = {
+  walletPrivateService: inject<WalletPrivateService>(
+    TYPES.walletPrivateService
+  ),
+};
+
+const publicServices = {
+  walletPublicService: inject<WalletPublicService>(
+    TYPES.walletPublicService
+  ),
+};
+
+// 3. Compose into the wallet object
+const wallet = {
+  ...privateServices,
+  ...publicServices,
+};
+
+// 4. Run the container's init sequence (starts GC timer, validates API keys)
+init();
+
+// 5. Export for library consumers and assign to globalThis for the REPL
+export { wallet };
+export default wallet;
+Object.assign(globalThis, { wallet });
+```
+
+The boot order is strict by design:
+
+1. **`import "./core/provide"`** — must happen before any `inject` call so
+   the factories are registered first.
+2. **`inject<>()`** — resolves lazy service instances (construction is
+   deferred until `init()` calls each service's `init` method).
+3. **`init()`** — triggers the startup hook on `WalletPrivateService` (the
+   `singleshot` `init` method that starts the GC interval and validates the
+   Binance API credentials).
+
+---
+
+## Consuming the Library
+
+You do not construct services manually. Import `wallet` from the build
+output and get fully initialized, DI-wired instances:
+
+```typescript
+import { wallet } from "wallet-manager";
+
+// walletPublicService and walletPrivateService are singletons,
+// already wired together by the DI container.
+const price = await wallet.walletPublicService.fetchPrice("SOLUSDT");
+const orders = await wallet.walletPublicService.fetchOrders("SOLUSDT", 25);
+
+await wallet.walletPublicService.commitBuy("SOLUSDT", 20);
+```
+
+In the interactive REPL, the `wallet` global is injected automatically:
+
+```
+repl => await wallet.walletPublicService.fetchPrice("SOLUSDT")
+77.56
+repl => await wallet.walletPublicService.commitCancel("SOLUSDT")
+77.49
+```
+
+<Tip>
+  During testing, call `override(TYPES.walletPrivateService, () => mock)`
+  **before** your first `inject` call to substitute the real Binance client
+  with a test double. The DI container respects the last registered factory
+  for any given symbol.
+</Tip>

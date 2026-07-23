@@ -1,0 +1,77 @@
+---
+title: "fetchFiat: USDT Free and Locked Balance"
+sidebarTitle: "fetchFiat"
+description: "fetchFiat returns the total USDT balance including both free and locked amounts from the Binance account, useful for checking available capital before a trade."
+---
+
+`fetchFiat` returns the total USDT balance in your Binance spot account, summing both the freely available amount and any USDT currently locked in open BUY orders. It is the quickest way to inspect your capital position before deciding whether to place a new buy, and can be used to verify that enough USDT is present before calling `commitBuy` or `commitTrade`.
+
+## Signature
+
+```typescript
+fetchFiat(symbol: string): Promise<number>
+```
+
+## Parameters
+
+<ParamField path="symbol" type="string" required>
+  A trading pair symbol used for queue routing, e.g. `"SOLUSDT"`. The `symbol` parameter is accepted to integrate with the per-symbol `EventListener` queue in `WalletPublicService`, but the underlying `FETCH_FIAT_FN` call fetches the full account USDT balance regardless of which symbol is passed. Any valid symbol from the supported list can be used.
+</ParamField>
+
+## Return value
+
+`Promise<number>` — the total USDT balance as a number: `free + locked`. Returns `0` if no USDT balance entry is found in the account (e.g. the account has never held USDT).
+
+## How the balance is computed
+
+The underlying `FETCH_FIAT_FN` reads the account balances from `binance.account()` and finds the `USDT` asset entry:
+
+```typescript
+const account = await binance.account();
+const usdtBalance = account.balances.find(
+  (balance) => balance.asset === "USDT"
+);
+
+if (!usdtBalance) {
+  return 0;
+}
+
+return parseFloat(usdtBalance.free) + parseFloat(usdtBalance.locked);
+```
+
+- `free` — USDT available for new orders.
+- `locked` — USDT currently reserved by open BUY orders on any symbol.
+
+The sum gives the total USDT present in the account, regardless of how it is currently allocated.
+
+## Relationship to commitBuy guard
+
+Note that `commitBuy`'s balance guard checks only `usdtBalance.free` (not `free + locked`). `fetchFiat` returns the total, so the value it returns may be higher than what `commitBuy` would accept as available. To check exactly how much USDT `commitBuy` would see, inspect the `free` field directly via `wallet.walletPrivateService` in a debugging context.
+
+## Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// REPL usage:
+// repl => await wallet.walletPublicService.fetchFiat("SOLUSDT")
+// 142.37
+
+const totalUSDT = await walletPublicService.fetchFiat("SOLUSDT");
+console.log(`Total USDT balance (free + locked): ${totalUSDT}`);
+
+// Use it to gate a buy decision
+const tradeAmount = 20;
+if (totalUSDT >= tradeAmount) {
+  const fillPrice = await walletPublicService.commitBuy("SOLUSDT", tradeAmount);
+  console.log("Filled at", fillPrice);
+} else {
+  console.log("Insufficient USDT balance");
+}
+```
+
+<Note>
+  Because `symbol` is used only for queue routing, you can call `fetchFiat` with any supported symbol — the returned balance is always the account-wide USDT total, not a symbol-specific allocation.
+</Note>

@@ -1,0 +1,91 @@
+---
+title: "fetchBalance: Coin Balance with USDT Equivalent"
+sidebarTitle: "fetchBalance"
+description: "fetchBalance returns the quantity and USDT value for a specific coin, including amounts locked in open orders, sourced from the Binance account balance endpoint."
+---
+
+`fetchBalance` returns the total coin holding for a given symbol — both the freely available portion and any quantity currently locked in open orders — together with its current USDT equivalent. The function is useful for inspecting position size and valuation before making trading decisions, but note that the quantity includes locked funds: it is not the same as the free tradeable amount.
+
+## Signature
+
+```typescript
+fetchBalance(symbol: string): Promise<{ usdt: number; quantity: number }>
+```
+
+## Parameters
+
+<ParamField path="symbol" type="string" required>
+  Binance trading pair symbol, e.g. `"SOLUSDT"`. `WalletPublicService` internally extracts the coin name (`"SOL"`) by stripping `"USDT"` from the end via `getCoinName(symbol)`. The symbol must belong to the supported coin list.
+</ParamField>
+
+## Return value
+
+`Promise<{ usdt: number; quantity: number }>`
+
+<ResponseField name="quantity" type="number">
+  Total coin quantity held in the account. This is the **sum** of `available` (free, tradeable) and `onOrder` (locked in open orders) from `binance.balance()`. It is **not** the free amount — if you have an open SELL order, the locked quantity is included here.
+</ResponseField>
+
+<ResponseField name="usdt" type="number">
+  Current USDT value of the total quantity, computed as `quantity × price` where `price` is sourced from `binance.prices()` (a bulk price snapshot).
+</ResponseField>
+
+## Supported coin list
+
+`FETCH_BALANCE_FN` queries a fixed hardcoded symbol list. If `symbol` does not map to one of these coins, `WalletPublicService` throws an error (`fetchBalance failed coinName=<name>`):
+
+```typescript
+const SYMBOL_LIST = [
+  "BTCUSDT",
+  "POLUSDT",
+  "ZECUSDT",
+  "HYPEUSDT",
+  "DOGEUSDT",
+  "SOLUSDT",
+  "PENGUUSDT",
+  "TRXUSDT",
+  "HBARUSDT",
+  "NEARUSDT",
+  "FARTCOINUSDT",
+  "ETHUSDT",
+  "PUMPUSDT",
+];
+```
+
+The underlying `FETCH_BALANCE_FN` returns a `Record<string, { usdt: number; quantity: number }>` keyed by coin name (e.g. `"SOL"`, `"BTC"`). `WalletPublicService.fetchBalance` looks up the coin for the requested symbol and returns only that entry.
+
+## How quantity is computed
+
+```typescript
+// In FETCH_BALANCE_FN:
+const registry = await binance.balance();
+result[coinName] += Number(registry[coinName]?.available) || 0;
+result[coinName] += Number(registry[coinName]?.onOrder) || 0;
+```
+
+The `available` field is the freely tradeable amount. The `onOrder` field is the portion locked by pending orders. Together they represent the total position size.
+
+## Usage example
+
+```typescript
+import wallet from "wallet-manager";
+
+const { walletPublicService } = wallet;
+
+// REPL usage:
+// repl => await wallet.walletPublicService.fetchBalance("SOLUSDT")
+// { quantity: 0.5, usdt: 38.78 }
+
+const balance = await walletPublicService.fetchBalance("SOLUSDT");
+console.log(`SOL quantity (total): ${balance.quantity}`);
+console.log(`SOL value in USDT:    ${balance.usdt}`);
+
+// Check all tracked coins at once (raw private service call, for debugging):
+// const allBalances = await wallet.walletPrivateService.fetchBalance();
+// console.log(allBalances);
+// => { BTC: { quantity: 0.001, usdt: 95.2 }, SOL: { quantity: 0.5, usdt: 38.78 }, ... }
+```
+
+<Note>
+  `quantity` includes coins locked in open orders (`onOrder`). If you need the free tradeable amount for order sizing, use `fetchFiat` for USDT or check `binance.balance()` directly via `walletPrivateService` for the `available` field. The `commitBuy` guard uses `binance.account()` (not `fetchBalance`) to read the free USDT, which avoids this ambiguity.
+</Note>

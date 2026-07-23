@@ -1,0 +1,239 @@
+---
+title: "Implementing onOrderOpenCommit for Binance Spot"
+sidebarTitle: "Order Open"
+description: "The onOrderOpenCommit hook places a limit buy, polls for fill, cancels on timeout with market fallback, and reconciles by clientOrderId on retry attempts."
+---
+
+## Overview
+
+`onOrderOpenCommit` is called by the backtest-kit engine whenever it wants to open a new position. For Binance spot the flow is: place a limit BUY at the requested price, poll until filled or timeout, and clean up before any throw so the exchange is never left with a resting order the engine doesn't know about.
+
+The full implementation from the reference `SpotBroker` adapter is annotated step by step below.
+
+## Implementation walkthrough
+
+<Steps>
+
+### Step 1 — Backtest and schedule guard
+
+```typescript
+if (payload.backtest) return;          // never touch the exchange in backtest mode
+if (payload.type !== "active") return; // "schedule" (resting-order placement) is a separate branch
+```
+
+The engine passes `payload.backtest = true` when running a historical simulation. The adapter must never call the exchange in that mode — return early without placing any order.
+
+The `type` guard separates "active" signals (immediate market entry) from "schedule" signals (resting limit orders placed ahead of price). Only `"active"` is handled here.
+
+<Note>
+Returning `undefined` (i.e. falling through without throwing) is the correct success signal in backtest mode. The engine records the open as if the order filled at `payload.priceOpen`.
+</Note>
+
+### Step 2 — Reconcile by `clientOrderId` on retry (`attempt > 0`)
+
+```typescript
+const { symbol, signalId, attempt, cost, priceOpen } = payload;
+
+if (attempt > 0) {
+  const prior = await binance
+    .orderStatus(symbol, undefined, undefined, { origClientOrderId: signalId })
+    .catch(() => null);
+
+  if (prior?.status === "FILLED") {
+    return; // already bought — confirm without re-sending
+  }
+
+  if (prior && (prior.status === "NEW" || prior.status === "PARTIALLY_FILLED")) {
+    await binance.cancel(symbol, prior.orderId); // kill the stale remainder
+  }
+}
+```
+
+`attempt > 0` means the previous call threw — but the throw may have happened *after* the order reached Binance. The `signalId` is used as the `clientOrderId` (see Step 4), so querying by `origClientOrderId: signalId` finds any order from the previous attempt.
+
+| Prior order status | Action |
+|---|---|
+| `FILLED` | Return early — the position is already open, confirm silently |
+| `NEW` or `PARTIALLY_FILLED` | Cancel the stale order before re-submitting |
+| Not found / network error | Continue normally — post a fresh order |
+
+<Note>
+Binance's duplicate `clientOrderId` guard only protects **open** orders. An order that filled instantly would not be caught by the dedup layer, which is exactly why this explicit reconcile step exists.
+</Note>
+
+### Step 3 — Format quantity and price
+
+```typescript
+const quantity = await formatQuantity(symbol, cost / priceOpen, binance);
+const price    = await formatPrice(symbol, priceOpen, binance);
+```
+
+Binance rejects orders whose quantity or price does not align with the symbol's filter precision. `formatQuantity` reads `LOT_SIZE.stepSize` from the exchange info and rounds to the correct number of decimal places. `formatPrice` does the same using `PRICE_FILTER.tickSize`.
+
+Both helpers are backed by a `memoize` cache keyed on `${symbol}-${filterType}` so the exchange-info round-trip only happens once per symbol per process.
+
+### Step 4 — Place the limit BUY
+
+```typescript
+const order = await binance.order("LIMIT", "BUY", symbol, Number(quantity), Number(price), {
+  newClientOrderId: signalId,
+});
+
+if (order.status === "FILLED") {
+  return; // instant fill — confirm immediately
+}
+```
+
+Setting `newClientOrderId: signalId` is the idempotency anchor for Rule 2: every retry can locate this exact order by `origClientOrderId`.
+
+If Binance reports `FILLED` synchronously in the response (common when price has already moved through the limit) the adapter returns immediately.
+
+### Step 5 — Poll for fill
+
+```typescript
+let last = order;
+for (let i = 0; i !== FILL_POLL_ATTEMPTS; i++) {  // 10 iterations
+  await sleep(FILL_POLL_INTERVAL_MS);               // 10 000 ms each
+  last = await binance.orderStatus(symbol, order.orderId);
+  if (last.status === "FILLED") {
+    return; // fill arrived — confirm
+  }
+}
+```
+
+The adapter sleeps 10 seconds between polls and checks up to 10 times — a maximum wait of approximately 100 seconds. If `FILLED` arrives at any point, the function returns and the engine records the open.
+
+### Step 6 — Timeout handling (Rule 1)
+
+```typescript
+// Cancel the unfilled order
+await binance.cancel(symbol, order.orderId);
+
+// Market-sell any partial fill to restore a clean cash position
+const executedQty = Number(last?.executedQty ?? 0);
+if (executedQty > 0) {
+  const sellQty = await formatQuantity(symbol, executedQty, binance);
+  await binance.marketSell(symbol, Number(sellQty));
+}
+```
+
+If the poll loop exhausts all attempts without a fill, the order is cancelled first. If `executedQty > 0` — meaning some quantity partially filled before the cancel landed — that amount is immediately market-sold to restore a flat cash position.
+
+<Note>
+**This is Rule 1.** Without the cancel + market-sell, the throw on the next line would leave a live order (or unreported coin) on the exchange. On the next retry, Step 2 would find it as `NEW`/`PARTIALLY_FILLED` and cancel it — but any partial fill that happened in the interim would become an orphan position the engine never knows about. The rollback here prevents that entirely.
+</Note>
+
+### Step 7 — Terminal rejection on the fifth attempt (Rule 3)
+
+```typescript
+if (attempt >= LAST_OPEN_ATTEMPT) {   // LAST_OPEN_ATTEMPT = 4
+  throw new OrderRejectedError(
+    `entry ${signalId} not filled after ${attempt + 1} attempts — giving up`
+  );
+}
+```
+
+`CC_ORDER_OPEN_RETRY_ATTEMPTS = 5` means `attempt` arrives as `0`–`4`. When `attempt === 4`, this is the final budget slot. Throwing `OrderRejectedError` (not plain `Error`) tells the engine to consume the `signalId` into `lastPendingId` — the signal is marked as permanently rejected and will never be re-issued.
+
+<Note>
+Using a plain `Error` here would cause the engine to keep retrying forever because `LAST_OPEN_ATTEMPT` is already reached and the budget would never advance. `OrderRejectedError` is the correct terminal signal.
+</Note>
+
+### Step 8 — Transient retry throw
+
+```typescript
+throw new Error(
+  `Limit order [buy ${quantity} ${symbol} @ ${price}] not filled — backtest-kit will retry`
+);
+```
+
+For attempts `0`–`3`, a plain `Error` is thrown. The engine treats this as transient: it schedules a retry on the next tick with the same `signalId` and `attempt + 1`. On the next call, Step 2 will reconcile state before posting again.
+
+</Steps>
+
+## Complete `onOrderOpenCommit` code
+
+```typescript
+override async onOrderOpenCommit(payload: BrokerOrderOpenPayload) {
+  if (payload.backtest) return;          // never touch the exchange in backtest mode
+  if (payload.type !== "active") return; // "schedule" is a separate branch
+  const { symbol, signalId, attempt, cost, priceOpen } = payload;
+  const binance = await getBinance();
+
+  // Rule 2: reconcile by clientOrderId before posting again
+  if (attempt > 0) {
+    const prior = await binance
+      .orderStatus(symbol, undefined, undefined, { origClientOrderId: signalId })
+      .catch(() => null);
+    if (prior?.status === "FILLED") {
+      return;
+    }
+    if (prior && (prior.status === "NEW" || prior.status === "PARTIALLY_FILLED")) {
+      await binance.cancel(symbol, prior.orderId);
+    }
+  }
+
+  const quantity = await formatQuantity(symbol, cost / priceOpen, binance);
+  const price    = await formatPrice(symbol, priceOpen, binance);
+
+  const order = await binance.order("LIMIT", "BUY", symbol, Number(quantity), Number(price), {
+    newClientOrderId: signalId,
+  });
+
+  if (order.status === "FILLED") {
+    return;
+  }
+
+  let last = order;
+  for (let i = 0; i !== FILL_POLL_ATTEMPTS; i++) {
+    await sleep(FILL_POLL_INTERVAL_MS);
+    last = await binance.orderStatus(symbol, order.orderId);
+    if (last.status === "FILLED") {
+      return;
+    }
+  }
+
+  // Rule 1: cancel and roll back before throwing
+  await binance.cancel(symbol, order.orderId);
+  const executedQty = Number(last?.executedQty ?? 0);
+  if (executedQty > 0) {
+    const sellQty = await formatQuantity(symbol, executedQty, binance);
+    await binance.marketSell(symbol, Number(sellQty));
+  }
+
+  // Rule 3: terminal rejection on the fifth attempt
+  if (attempt >= LAST_OPEN_ATTEMPT) {
+    throw new OrderRejectedError(
+      `entry ${signalId} not filled after ${attempt + 1} attempts — giving up`
+    );
+  }
+
+  // Transient: engine retries with attempt + 1
+  throw new Error(`Limit order [buy ${quantity} ${symbol} @ ${price}] not filled — backtest-kit will retry`);
+}
+```
+
+## Decision tree
+
+```
+onOrderOpenCommit called
+│
+├─ payload.backtest? ──────────────────────────────── return (no-op)
+├─ payload.type !== "active"? ─────────────────────── return (no-op)
+│
+├─ attempt > 0?
+│   ├─ prior order FILLED? ────────────────────────── return (already bought)
+│   └─ prior order NEW/PARTIAL? ───────────────────── cancel stale → continue
+│
+├─ format quantity + price (LOT_SIZE stepSize, PRICE_FILTER tickSize)
+├─ place LIMIT BUY with newClientOrderId = signalId
+│   └─ status FILLED? ─────────────────────────────── return (instant fill)
+│
+├─ poll loop (10 × 10 s)
+│   └─ status FILLED? ─────────────────────────────── return (fill arrived)
+│
+├─ timeout → cancel order → market-sell executedQty (Rule 1)
+│
+├─ attempt >= 4? ──────────────────────────────────── throw OrderRejectedError (terminal, Rule 3)
+└─ else ───────────────────────────────────────────── throw Error (transient retry)
+```
